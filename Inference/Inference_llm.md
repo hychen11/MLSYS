@@ -1,6 +1,6 @@
 # LLM 推理笔记：从 KV Cache 到推理引擎
 
-这份笔记按「基础指标 → vLLM 使用 → 显存管理 → 调度 → 前缀复用 → 图优化 → nano-vllm 实现」的顺序展开。文中涉及的默认值和内部实现会随 vLLM 版本变化，具体部署以所用版本的文档和源码为准。
+这份笔记按「基础指标 → vLLM 使用 → 显存管理 → 调度 → 前缀复用 → 图优化 → nano-vllm 实现 → 投机解码」的顺序展开。文中涉及的默认值和内部实现会随版本变化，具体部署以所用版本的文档和源码为准。
 
 ## 1. 推理基础与性能指标
 
@@ -1443,6 +1443,74 @@ $$
 
 nano-vllm 没有实现 top-k、top-p、重复惩罚等策略，`SamplingParams` 也只有三个字段
 
+### Scheduler：等待、运行与抢占
+
+nano-vllm 的 `Scheduler` 用两条队列管理请求：
+
+| 队列 | 保存的请求 | 调度行为 |
+| --- | --- | --- |
+| `waiting` | 新请求、未完成 Prefill 的请求，以及被抢占后需重新计算的请求 | 优先安排 Prefill；未算完的请求留在队首，下一步继续。 |
+| `running` | Prefill 已完成、等待继续生成的请求 | 当本步没有可调度的 Prefill 时，才安排 Decode。 |
+
+`schedule()` 返回 `(seqs, is_prefill)`，因此 nano-vllm **同一步只执行一种阶段**。Prefill 优先于 Decode；如果 Token Budget 不够，源码允许本批第一条请求分块 Prefill，后续请求等下一步。Decode 时若 KV 块不足，调度器会抢占请求、释放其块，并把它放回 `waiting` 队首。`postprocess()` 更新已缓存 Token 数、追加采样结果，并在 EOS 或长度上限时释放块。
+
+### ModelRunner：从请求到 GPU 前向
+
+`LLMEngine.step()` 每轮调用一次 `ModelRunner.run(seqs, is_prefill)`。它把 `Sequence` 对象转成 GPU 张量，执行模型前向和采样；只有 rank 0 返回采样出的 Token ID。下列代码省略了类型标注：
+
+```python
+def run(self, seqs, is_prefill):
+    if is_prefill:
+        input_ids, positions = self.prepare_prefill(seqs)
+    else:
+        input_ids, positions = self.prepare_decode(seqs)
+    temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+    logits = self.run_model(input_ids, positions, is_prefill)
+    token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+    reset_context()
+    return token_ids
+```
+
+初始化时，`ModelRunner` 依次建立 NCCL 进程组并绑定 GPU、加载模型权重、执行 warmup、分配 KV Cache；若未设置 `enforce_eager`，再捕获 Decode 的 CUDA Graph。TP 大于 1 时，rank 0 通过共享内存与 `Event` 通知其他 worker 执行相同操作。
+
+#### Prefill 与 Decode 的张量准备
+
+Prefill 可把多条不同长度的请求拼接处理。`prepare_prefill()` 为本步待计算的 Token 生成 `input_ids`、`positions` 和 `slot_mapping`；用 `cu_seqlens_q` 标出本步 Query 的边界，用 `cu_seqlens_k` 标出包含历史前缀的 Key/Value 边界。若存在已缓存前缀，即总 K 长度大于总 Q 长度，还会准备 `block_tables`，让 Attention 从分页 KV Cache 读取历史部分。
+
+例如两条请求分别新增 2、3 个 Token，第一条已有 4 个历史 Token，第二条没有历史，则：
+
+```text
+cu_seqlens_q = [0, 2, 5]
+cu_seqlens_k = [0, 6, 9]
+```
+
+`slot_mapping` 指定新 K/V 写入 KV Cache 的位置。对序列中的位置 `pos`，其物理槽位为：
+
+```text
+block_index = pos // block_size
+slot = block_table[block_index] * block_size + pos % block_size
+```
+
+Decode 每条请求只处理一个新 Token。`prepare_decode()` 使用 `seq.last_token` 作为输入，并准备 `positions`、`context_lens`、`slot_mapping` 和 `block_tables`。`context_lens` 包含当前 Token：Attention 会先把它的 K/V 写入缓存，再读取该序列截至当前位置的 KV。TP worker 收到的 Decode 序列可以只有 `last_token`，不必传完整 Token 历史。
+
+`block_tables` 会用 `-1` 补齐为矩阵；这些是无效块占位。CUDA Graph 为补齐 Batch 而使用的 `slot_mapping = -1` 则表示对应的虚拟 Token 不应写入 KV Cache。两种 `-1` 的用途不同。
+
+#### Context 与 KV Cache 分配
+
+Attention、LMHead 等算子需要 `cu_seqlens`、`slot_mapping`、`block_tables` 和 `is_prefill` 等元数据。nano-vllm 用 `set_context()` 在前向前保存它们，算子通过 `get_context()` 读取，本步结束再调用 `reset_context()`。
+
+KV Cache 在模型加载和 warmup 后分配。warmup 用假序列执行 Prefill，记录运行时的显存峰值；随后 `allocate_kv_cache()` 根据总显存、当前占用、峰值增量、`gpu_memory_utilization` 和单块字节数，计算可分配的 KV 块数量。单块字节数与层数、块大小、每卡 KV 头数、头维度及元素精度成正比。
+
+#### nano-vllm 的 CUDA Graph 路径
+
+这个实现只对 Decode 捕获 CUDA Graph。`run_model()` 在 Prefill、`enforce_eager=True` 或 Batch 大于 512 时走 eager；否则选择一个不小于当前 Batch 的已捕获尺寸，填充输入缓冲区后重放图。图只覆盖模型前向得到 hidden states；`compute_logits()` 和采样仍在图外执行。
+
+捕获尺寸由代码构造为 `[1, 2, 4, 8]`，再加上不超过 `min(max_num_seqs, 512)` 的 16 的倍数。实际 Batch 例如为 13 时，可按 16 的图重放；填充位置的 `slot_mapping` 设为 `-1`，避免写入无效 KV。这里描述的是 nano-vllm 当前实现，不能直接套用到 vLLM 的图模式。
+
+## 9. 投机解码：基本思路
+
+投机解码由草稿模型等机制先提出若干候选 Token，再由目标模型并行计算这些位置的条件分布，按接受规则逐个验证。被接受的连续前缀可以减少目标模型逐 Token 前向的次数；若有拒绝，则按目标分布修正采样，以保持目标模型的输出分布。上面的 `slot_mapping` 计算属于 KV Cache 地址映射，并不是投机解码算法本身。此处仅记录概念，前文所述 nano-vllm `SamplingParams` 和调度器没有实现投机解码。
+
 ## 参考资料
 
 - [vLLM Quickstart](https://docs.vllm.ai/en/stable/getting_started/quickstart/)：离线与在线调用。
@@ -1453,3 +1521,4 @@ nano-vllm 没有实现 top-k、top-p、重复惩罚等策略，`SamplingParams` 
 - [nano-vllm 源码](https://github.com/GeeeekExplorer/nano-vllm)：第 8 节的简化实现。
 - [FlashAttention 分页 KV 接口](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_interface.py)：`page_block_size` 约束。
 - [PyTorch 多进程实践](https://docs.pytorch.org/docs/stable/notes/multiprocessing.html)：CUDA 与 Poison Fork。
+- [投机解码原论文](https://arxiv.org/abs/2211.17192)：草稿生成、目标模型验证与输出分布保持。
