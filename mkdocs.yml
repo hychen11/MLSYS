@@ -1,0 +1,104 @@
+site_name: MLSys 笔记
+site_description: LLM 推理系统、CUDA 算子、量化与性能分析学习笔记
+site_url: https://hychen11.github.io/MLSYS/
+repo_url: https://github.com/hychen11/MLSYS
+repo_name: hychen11/MLSYS
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - navigation.instant
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: orange
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: orange
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search:
+      lang: zh
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3.2.2/es5/tex-mml-chtml.js
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - 首页: index.md
+  - LLM 推理:
+      - inference/index.md
+      - 推理基础与性能指标: inference/01-basics.md
+      - vLLM 使用与核心能力: inference/02-vllm.md
+      - PagedAttention: inference/03-paged-attention.md
+      - Continuous Batching: inference/04-continuous-batching.md
+      - Prefix Cache 与 RadixAttention: inference/05-prefix-cache.md
+      - Chunked Prefill 与 Token Budget: inference/06-chunked-prefill.md
+      - Attention 后端与图优化: inference/07-graph-optimization.md
+      - 投机解码: inference/08-speculative-decoding.md
+      - nano-vllm 源码走读:
+          - 接口与引擎主循环: inference/nano-vllm/01-engine.md
+          - 模型与核心算子: inference/nano-vllm/02-model.md
+          - 调度与 ModelRunner: inference/nano-vllm/03-runner.md
+  - 性能分析:
+      - Roofline 与 Nsight: performance/roofline.md
+  - CUDA 算子:
+      - Reduce 优化 V0→V7: cuda/reduce.md
+      - Shared Memory Bank Conflict: cuda/shared-memory-bank.md
+  - 量化:
+      - 数值格式与量化基础: quantization/basics.md
+
+validation:
+  links:
+    anchors: warn

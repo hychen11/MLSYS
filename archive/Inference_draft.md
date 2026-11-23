@@ -1,27 +1,19 @@
-# LLM 推理笔记：从 KV Cache 到推理引擎
+# day 1 basic
 
-这份笔记按「基础指标 → vLLM 使用 → 显存管理 → 调度 → 前缀复用 → 图优化 → nano-vllm 实现 → 投机解码」的顺序展开。文中涉及的默认值和内部实现会随版本变化，具体部署以所用版本的文档和源码为准。
+prefill TTFT first token
 
-## 1. 推理基础与性能指标
+decode TPOT  Time Per Output Token
 
-### Prefill、Decode 与 KV Cache
+kv cache生命周期
 
-Prefill 并行处理输入 Prompt，是 TTFT（Time to First Token，首 Token 延迟）的主要组成部分；Decode 逐 Token 生成输出，通常用 TPOT（Time per Output Token，平均每个后续输出 Token 的耗时）衡量。
-
-KV Cache 的生命周期：
-
-- **分配**：请求进入后，引擎按需为 KV Cache 分配显存；具体粒度取决于缓存管理方式。
+- **分配**：请求进来，推理引擎为它预留一块显存放 KV Cache
 - **填充**：Prefill 阶段一次性把整段 Prompt 的 K、V 算出来写进缓存；Decode 每步再追加 1 个 Token 的 K、V
 - **使用**：每一步 Decode 都要读取全部历史 KV 来算 Attention
 - **释放**：请求生成结束（EOS 或达到长度上限），显存归还
 
-如果不保存 KV，每生成一个 Token，都要重新计算已有上下文的 K、V；KV Cache 用显存换掉了这部分重复计算。
+没有kv cache相当于每次decode都算一次prefill？
 
-在标准全注意力、各层 KV 形状相同且不计块元数据等开销时，缓存容量约为：
-
-$$
-\boxed{ M_{\text{KV}}=2\times B\times L\times S\times H_{kv}\times D\times P }
-$$
+\[ \boxed{ M_{\text{KV}}=2\times B\times L\times S\times H_{kv}\times D\times P } \]
 
 其中：
 
@@ -37,13 +29,17 @@ $$
 
 注意：这里使用的是 KV Heads，而不是 Query Heads。
 
-### GQA 与 KV 头数
+### GQA
 
-若分组大小 `G = 4`，每 4 个 Query 头共享一组 K/V 头。MHA 中 `H_q = H_kv`；GQA 中 `H_q = G × H_kv`；MQA 则只有一个 KV 头。
+如果G=4，4个query共享一组kv head
 
-**关键点**：KV Cache 大小与 KV 头数成正比。若 Query 头数为 32、KV 头数为 8，其他条件不变时，相比 32 个 KV 头的 MHA，缓存约降至 **1/4**。GQA/MQA 减少显存占用，但效果和性能仍需按模型评估。
+标准MHA 就是H_q=H_kv
 
-### KV Cache 的碎片化
+GQA变成H_q = H_kv * G
+
+**关键点**：在公式里是线性因子，这正是 **GQA（分组查询注意力）/ MQA（多查询注意力）**能大幅省显存的原因——让多个 Query 头共享一组 KV 头。比如 32 个 Query 头共享 8 个 KV 头（GQA），KV Cache 直接砍到原来的 ，而模型表达能力几乎不受影响。现代大模型几乎清一色采用 GQA，就是这笔账算出来的。
+
+#### 碎片化
 
 请求实际只生成了 100 个 Token，却按 2048 预留，剩下的座位全部空占——这叫**内部碎片**；
 
@@ -51,21 +47,21 @@ $$
 
 碎片化会让 KV Cache 的实际显存利用率大打折扣，大量显存被无效预留白白浪费。这正是 vLLM 的 PagedAttention 要解决的核心问题——它把连续大块换成了操作系统式的分页管理
 
-### 性能指标
+### metrics
 
-#### 延迟
+#### latency
 
-| 指标 | 含义 |
-| --- | --- |
-| TTFT | 从提交请求到收到首个输出 Token 的时间，包含排队、预处理与 Prefill 等开销。 |
-| TPOT | 首 Token 之后，平均每个输出 Token 的耗时。 |
-| E2E latency | 从提交请求到收到完整响应的时间。 |
+TTFT
 
-输出长度为 `N ≥ 1` 时，若 TPOT 取后续 Token 间隔的平均值，则 `E2E latency = TTFT + (N - 1) × TPOT`。短输出通常更受 TTFT 影响，长输出则更受 TPOT 影响。
+TPOT
+
+E2E Latency 从提交请求到收到完整响应的总时间，**短输出场景 TTFT 主导，长输出场景 TPOT 主导**
+
+E2E latency = TTFT + TPOT *(output_len-1)
 
 先测清楚自己的输入输出长度分布，再谈优化
 
-#### 吞吐
+#### throughput
 
 | 指标              | 含义                        | 适用视角               |
 | :---------------- | :-------------------------- | :--------------------- |
@@ -77,7 +73,7 @@ $$
 
 **吞吐和延迟通常是一对矛盾**：把更多请求塞进一个 Batch 能提高系统吞吐，但每个请求的排队和计算时间变长，单用户延迟变差。
 
-#### 尾延迟与 Goodput
+#### tail latency & Goodput
 
 平均延迟是最容易骗人的指标。真实流量下，少数请求可能慢得离谱，而平均值把它们藏了起来。所以生产环境更看**尾延迟**
 
@@ -85,14 +81,24 @@ $$
 
 **Goodput（有效吞吐）**是比 Raw QPS 更贴近真实价值的指标。它只统计**满足 SLO（比如 TTFT < 1s 且 TPOT < 50ms）的那部分请求的吞吐**。一个系统 QPS 很高但大部分请求都超时，Goodput 就很低——用户根本用不爽
 
-### Decode 的性能瓶颈
+### Decode
 
-小 Batch 的 Decode 往往受显存带宽限制：以 FP16/BF16 线性层为例，单 Token 对每个权重约做一次乘加（约 2 FLOPs），读取一个 2 字节权重，忽略激活和缓存流量时，权重相关算术强度约为 **1 FLOP/Byte**。这只是简化估算，不能据此直接推断整卡利用率。
+decode mem-bound fp16搬运W数据，计算W/2，乘加算两个，所以AI=(2*W/2)/W = 1 FLOP/Byte，GPU 算力利用率理论上还不到 1%
 
-将多个请求组成 Batch 后，线性层计算可看作 `[B, D] × [D, D]`；多个 Token 复用同一批权重，通常能提高吞吐。收益会受 KV 读取、Batch 大小、Kernel 和硬件限制。
+所以需要batch，会放大batch 倍
 
-1. **Batching**：同一次前向让多个 Decode Token 分摊权重读取，通常提高系统吞吐；Batch 过大也会拉长单步耗时及排队时间。
-2. **Weight-only 量化**：仅比较原始权重，INT4 的位宽是 FP16 的 **1/4**。实际节省和加速还受量化元数据、反量化、KV 访问与 Kernel 实现影响。
+X [B,L,D],W [D,D]
+
+qkv BLD
+
+GEMM的时候会展开成 [BL, D]
+
+所以增大batch size会增大 AI
+
+1. **为什么 Batch 能大幅提升吞吐却几乎不增加延迟**：把多个请求的 Decode 拼成一个 Batch，权重只搬一次就能服务整个 Batch 的所有 Token，算术强度成倍提升，把闲置的算力利用起来——这正是 Continuous Batching 的理论依据。
+2. **为什么量化（尤其是 Weight-only）对 Decode 加速明显**：Decode 瓶颈在搬权重，把权重从 FP16 压到 INT4，要搬的字节数直接减少到 ，延迟随之大幅下降。
+
+
 
 | 环节        | 做什么                                                  | 计算特性           | 潜在瓶颈                    |
 | :---------- | :------------------------------------------------------ | :----------------- | :-------------------------- |
@@ -104,27 +110,30 @@ $$
 
 Tokenize / Detokenize 是 **CPU 任务**，却容易被忽视。当 GPU 优化到位后，CPU 上的这些环节反而可能成为新瓶颈——这正是 vLLM V1 引擎用多进程把它们和 GPU 核心循环重叠起来的原因
 
-## 2. vLLM：使用与核心能力
+# day 2 vllm
 
 | 特性                    | 说明                                                         |
 | :---------------------- | :----------------------------------------------------------- |
-| **PagedAttention**      | 借鉴分页思想按块管理 KV Cache，减少预留浪费 |
+| **PagedAttention**      | 借鉴操作系统虚拟内存分页思想管理 KV Cache，显存利用率接近最优 |
 | **Continuous Batching** | 动态地将新请求插入正在处理的批次，而非等一批全部完成再开始下一批 |
-| **OpenAI 兼容 API**     | 提供兼容的服务端接口；客户端仍需确认模型名及参数。 |
-| **模型与硬件支持**      | 支持多种模型架构和硬件，具体组合取决于版本与后端。 |
-| **量化支持**            | 支持多种量化格式，实际可用性需按模型与硬件核对。 |
+| **OpenAI 兼容 API**     | 直接替换 OpenAI 客户端的 `base_url`，无需修改业务代码        |
+| **200+ 模型支持**       | 覆盖 Llama、Qwen、Mistral、DeepSeek 等主流架构，含 MoE 和多模态模型 |
+| **多硬件支持**          | NVIDIA GPU、AMD GPU、Google TPU、Intel Gaudi、CPU 等         |
+| **丰富的量化方案**      | FP8、INT8、INT4、GPTQ、AWQ、GGUF 等开箱即用                  |
 
-核心关系：PagedAttention 提高 KV Cache 利用率；Continuous Batching 提高请求调度效率；高效 Kernel 与图优化降低单步执行开销。
+* PagedAttention -> high gpu util
+* Continuous Batching -> high throughput
+* CUDA Kernels -> low latency
 
-LLM 在 Decode 阶段需要读取历史 Token 的 K、V。早期连续分配方案可能按预期最大长度预留较大空间，造成浪费；PagedAttention 让逻辑连续的缓存映射到可分散的物理块。
+LLM 推理的 Decode 阶段需要缓存之前所有 token 的 Key 和 Value 向量（即 KV Cache），以避免重复计算。传统做法是为每个请求**预分配一块连续的显存空间**，大小按模型支持的最大序列长度计算。
 
 这就带来了三个问题：
 
 - **内部碎片**：大多数请求用不到最大长度，预留空间大量浪费
 - **外部碎片**：请求结束后释放的空间大小不一，难以被新请求复用
-- **共享不灵活**：多个请求的相同前缀难以在连续布局中高效复用；并非完全无法实现共享。
+- **无法共享**：Beam Search 等场景中，多个候选序列共享前缀部分的 KV Cache，但连续内存布局无法实现共享
 
-KV Cache 占用取决于层数、上下文长度、KV 头数和精度，应使用上一节的公式估算，而非仅凭模型参数量判断。
+**提示**：对于一个 13B 参数的模型，单个请求的 KV Cache 在最大序列长度下可能占用数 GB 显存。如果同时处理几十个请求，显存瓶颈会比模型权重本身更严重。
 
 1. **分块存储**：KV Cache 不再要求连续内存，而是被切分成固定大小的 Block（如 16 个 token 为一个 Block）
 2. **按需分配**：每生成一个 token，只在当前 Block 未满时追加，填满后才分配新的 Block
@@ -133,14 +142,15 @@ KV Cache 占用取决于层数、上下文长度、KV 头数和精度，应使�
 
 **注意**：PagedAttention 的分块存储意味着 KV Cache 在物理上是不连续的，vLLM 需要专门的 CUDA Kernel 来高效地从分散的 Block 中读取数据进行 Attention 计算。
 
-### 离线推理
+### Offline
 
 离线推理适合**不需要实时响应**的场景，如批量文本生成、数据标注、评测跑分等。vLLM 提供 `LLM`类作为离线推理的主入口
+
 ```
 llm.generate()
 ```
 
-### Chat Template
+### Chat 就是带有role的
 
 ```python
 llm.chat(messages_list, sampling_params)
@@ -156,6 +166,7 @@ outputs = llm.generate(texts, SamplingParams(temperature=0.7))
 ```
 
 会构造这种role，模型在 SFT（Supervised Fine-Tuning）阶段接触了大量按照 Chat Template 构造的训练数据
+
 ```
 <|im_start|>user
 1 + 1 = ?<|im_end|>
@@ -163,20 +174,21 @@ outputs = llm.generate(texts, SamplingParams(temperature=0.7))
 2<|im_end|>
 ```
 
-### 在线服务
+### Online
+
 ```
 vllm serve Qwen/Qwen2.5-7B-Instruct \
     --host 0.0.0.0 \
     --port 8080 \
     --tensor-parallel-size 2
 ```
+
 ```
 v1/chat/completions
 ```
 
-| 接口 | 用途 |
-| --- | --- |
 | `POST /v1/completions`      | 文本补全 |
+| --------------------------- | -------- |
 | `POST /v1/chat/completions` | 对话补全 |
 
 采样参数（SamplingParams）
@@ -185,31 +197,31 @@ v1/chat/completions
 | :------------------- | :--------------------------------------- | :----------- |
 | `temperature`        | 控制随机性，越高越随机                   | 1.0          |
 | `top_p`              | 核采样，只从累计概率前 p 的 token 中采样 | 1.0          |
-| `top_k`              | 只从概率最高的 k 个 token 中采样         | 随版本而定；0 或 -1 常表示不限制 |
-| `max_tokens`         | 最大生成 token 数                        | 随版本及调用方式而定 |
+| `top_k`              | 只从概率最高的 k 个 token 中采样         | -1（不限制） |
+| `max_tokens`         | 最大生成 token 数                        | 16           |
 | `repetition_penalty` | 重复惩罚系数，>1 减少重复                | 1.0          |
 | `stop`               | 遇到指定字符串时停止生成                 | None         |
 | `n`                  | 为每个 prompt 生成的序列数               | 1            |
 | `seed`               | 随机种子，设置后可复现结果               | None         |
 
-采样参数应按任务评估。需要更稳定输出时可从 `temperature=0` 开始，并显式设置 `max_tokens`；模型的 `generation_config.json` 也可能影响默认采样值。
+**提示**：对于大多数生产场景，推荐 `temperature=0.7, top_p=0.9`作为起点。追求确定性输出时设 `temperature=0`。
 
-| 参数                         | 说明                 | 设置建议           |
+| 参数                         | 说明                 | 推荐值           |
 | :--------------------------- | :------------------- | :--------------- |
 | `--model`                    | HuggingFace 模型标识 | -                |
 | **`--tensor-parallel-size`** | 张量并行 GPU 数      | 根据模型大小决定 |
-| `--gpu-memory-utilization`   | GPU 显存使用比例     | 按显存余量和 KV 需求调整 |
+| `--gpu-memory-utilization`   | GPU 显存使用比例     | 0.9（默认）      |
 | `--max-model-len`            | 模型最大序列长度     | 按需设置         |
 | `--dtype`                    | 模型权重精度         | auto             |
 | `--quantization`             | 量化方式             | None             |
-| `--max-num-seqs`             | 单步最大并发序列数   | 按目标负载压测 |
+| `--max-num-seqs`             | 最大并发序列数       | 256              |
 | **`--enforce-eager`**        | 禁用 CUDA Graph      | 调试时使用       |
 
-### 张量并行
+#### tensor parallel
 
-模型单卡放不下，或单卡性能无法满足目标时，可考虑张量并行。它增加跨卡通信，实际收益需结合互联带宽与负载测试。
+对于大部分场景，**张量并行是首选**，配置最简单且效果最好
 
-## 3. PagedAttention：块管理与抢占
+# day 3 PagedAttention
 
 Attention 计算时，CUDA Kernel 通过 Block Table 拿到每个逻辑位置对应的 `physical_block_number`（物理块号）和 `physical_block_offset`（块内偏移），就能从分散的物理块里正确读到所有历史 KV。
 
@@ -219,6 +231,7 @@ Attention 计算时，CUDA Kernel 通过 Block Table 拿到每个逻辑位置对
 - **`physical_block_offset`（块内偏移）**：定位这个 Token 在块内的第几格。
 
 vLLM 官方 Kernel 文档里，Key 指针的地址计算大致是这样一个形式（简化示意，非逐字照搬）：
+
 ```
 // 根据物理块号 + 头偏移 + 块内偏移，算出这个 token 的 Key 起始地址
 const scalar_t* k_ptr = k_cache
@@ -245,7 +258,7 @@ vLLM 官方这篇 Kernel 走读文档明确标注为"基于原始论文的历史
 
 一般来说 COW 通常不是因为要修改已经生成的历史 Token 的 KV，而是因为要向尚未填满的共享 Block 中追加新 Token 的 KV
 
-### 显存不足时的抢占
+### Preemption
 
 某一步 Decode 需要为若干请求追加新块，但空闲物理块不够。调度器会挑选部分请求"踢出"，释放它们占用的物理块。被踢出的请求，其已经算好的 KV Cache 有两种处理方式
 
@@ -254,19 +267,19 @@ vLLM 官方这篇 Kernel 走读文档明确标注为"基于原始论文的历史
 | **换出（Swapping）**        | 把 KV Cache 从 GPU 显存拷贝到 CPU 内存暂存，恢复时再拷回来   | 不用重算，省算力        | 占用 CPU 内存，来回拷贝有 PCIe 传输开销 |
 | **重计算（Recomputation）** | 直接丢弃 KV，恢复时把该请求已生成的 Token 当成新 Prompt 重新 Prefill 一遍 | 不占 CPU 内存，实现简单 | 要重跑一次 Prefill，浪费算力            |
 
-上表是 PagedAttention 论文和早期实现讨论的两种恢复思路。vLLM V1 的常规抢占路径采用重计算：释放块并重置已计算 Token 数，恢复时重新推进 Prefill。若前缀缓存中的满块仍可复用，实际重算量会减少。
+**提示**：上表是 PagedAttention 论文和 V0 的两种做法。vLLM V1 的抢占只走重计算：被抢占的请求释放全部块、`num_computed_tokens` 清零后放回等待队列头部，恢复时重新 Prefill。官方调优文档的解释是，V1 架构下重计算的开销更低。开着 Prefix Cache 时，被释放的满块只要还没被淘汰，恢复时还能直接命中，实际要重算的部分会少一些。
 
-抢占可以缓解 KV Cache 显存不足，但会增加重计算和延迟，不能保证所有情况下都不发生 OOM 或请求失败。若抢占频繁，应结合并发、KV Cache 空间和显存余量调参。
+**关键点**：抢占是 vLLM 在显存压力下**保证不 OOM、请求不失败**的兜底机制。如果你在日志里频繁看到 preemption 相关的告警，说明并发压得太满——要么调低并发、要么增大 `gpu_memory_utilization` 给 KV Cache 更多空间、要么加卡。它是”系统在硬扛”的信号，不是常态。
 
-通常先观察 `gpu_memory_utilization`、并发和前缀缓存命中率，再考虑块大小等底层参数；默认值随版本和硬件而变。
+**提示**：绝大多数场景下，你**不需要手动改 `block_size`**——默认值已在多数模型上调优过。真正常动的旋钮是 `gpu_memory_utilization`（压榨显存）和 `enable_prefix_caching`（有共享前缀就开）。
 
 ### KVCacheManager vs BlockPool
 
 Scheduler -> KVCacheManager -> BlockPool
 
 - **`KVCacheManager`**（`kv_cache_manager.py`）：**请求视角**的管理者。调度器每一步都通过它给请求申请、释放块。核心方法和前面讲的概念一一对应：
-  - `get_computed_blocks`：前缀缓存查询，返回该请求能命中的、已经算好的块，以及命中了多少 Token。这是第 5 节前缀复用的入口。
-  - `allocate_slots`：为请求新增的 Token 申请槽位/块，顺带释放不再需要的块，并检查空闲块是否够用；不够就返回 `None`（交给调度器触发抢占）。它对应本节的按需分块。
+  - `get_computed_blocks`：前缀缓存查询，返回该请求能命中的、已经算好的块，以及命中了多少 Token。这是第 6 节”共享前缀”的入口。
+  - `allocate_slots`：为请求新增的 Token 申请槽位/块，顺带释放不再需要的块，并检查空闲块是否够用；不够就返回 `None`（交给调度器触发抢占）。它对应第 3 节的”按需逐块分配”。
   - `free`：请求结束时**逆序**释放它的块——让尾部的块先被回收，因为头部的块更可能被前缀缓存复用，留得越久越好。
 - **`BlockPool`**（`block_pool.py`）：**全局视角**的物理块仓库，不关心哪个请求，只管”哪些块空着、哪些块被缓存着”。
 
@@ -277,7 +290,7 @@ Scheduler -> KVCacheManager -> BlockPool
 - **分配时**从头部快速取走 N 个（`popleft_n`）；
 - **前缀缓存命中时**，一个原本”空闲但仍缓存着有效内容”的块要被重新激活——需要从链表**中间任意位置**把它摘出来（`remove`）
 
-若已持有节点引用，双向链表能在 O(1) 时间从中间摘除节点。前缀缓存允许空闲块保留可复用内容，因此需要这种操作。
+普通队列没法 O(1)*O*(1) 地从中间删除，双向链表可以。前缀缓存要求”空闲块也可能携带可复用缓存”，所以 vLLM 选了双向链表
 
 这里free block只代表没有running request在用它
 
@@ -287,6 +300,7 @@ Scheduler -> KVCacheManager -> BlockPool
 - `block_hash != None`：它仍然记录着之前计算过的 KV Cache 内容，可以被其他请求复用。
 
 所以 **空闲块也可能是一个有效的缓存块**。
+
 ```
 class KVCacheBlock:
     def __init__(self, block_id):
@@ -334,11 +348,12 @@ def touch(self, blocks):                        # 前缀缓存命中时调用
         if blk.ref_cnt == 0:                    # 从空闲链表里"抢救"回来
             self.free_block_queue.remove(blk)
         blk.ref_cnt += 1
+
 ```
 
-## 4. Continuous Batching：迭代级调度
+# day 4 Continuous Batching
 
-将多个请求放进同一步执行，通常能提高吞吐；单请求延迟是否增加，取决于 Batch 大小、排队、KV 读取和硬件瓶颈。
+批处理提升的是**吞吐**，而且几乎不牺牲单请求延迟——因为瓶颈在搬权重，多算几个 Token 的计算量对 Memory Bound 的 Decode 来说近乎”免费”。
 
 1. **收新请求**：把新到达的请求放进 Waiting（等待）队列。
 2. **调度决策**：调度器决定这一步谁上车。它要同时兼顾两拨请求——正在生成的 Running 队列请求（做 Decode），和等待队列里能塞进来的新请求（做 Prefill）。是否有空间，取决于显存里还有多少空闲 KV Block（这正是 PagedAttention 提供的信息）。
@@ -346,7 +361,7 @@ def touch(self, blocks):                        # 前缀缓存命中时调用
 4. **处理产出**：把新 Token 追加到各请求的 KV Cache；检查哪些请求触发了 EOS 或长度上限，将其标记完成、**释放其占用的 KV Block** 归还给空闲池。
 5. **循环**：回到第 1 步。
 
-**提示**：当显存不够、Running 队列里请求太多时，调度器还会做**抢占（Preemption）**：暂停部分请求、释放它们的 KV Block，腾出显存保证其他请求推进。vLLM V1 被抢占的请求一律丢弃 KV、恢复时重算，第 3 节有对应说明。
+**提示**：当显存不够、Running 队列里请求太多时，调度器还会做**抢占（Preemption）**：暂停部分请求、释放它们的 KV Block，腾出显存保证其他请求推进。vLLM V1 被抢占的请求一律丢弃 KV、恢复时重算，第 6.3 节会看到对应的代码。
 
 | 技术                | 解决的问题         | 提供的能力                   |
 | :------------------ | :----------------- | :--------------------------- |
@@ -357,7 +372,8 @@ def touch(self, blocks):                        # 前缀缓存命中时调用
 
 V1 相比 V0 最大的设计变化是——**调度器眼里不再有”Prefill 阶段”和”Decode 阶段”之分**。源码注释里明确写了 “no ‘decoding phase’ nor ‘prefill phase’“：每个请求只是不停地把 `num_computed_tokens`（已计算 Token 数）推向 `num_tokens_with_spec`（含投机 Token 的总目标数）。这种统一视角，正是 2.4 节 Chunked Prefill 能把 Prefill 和 Decode 混在一步里跑的前提。
 
-### Scheduler 的两条队列
+### scheduler
+
 ```
                 Scheduler.schedule()
                        |
@@ -414,22 +430,27 @@ def schedule(self):
         while self.waiting and token_budget > 0:
             req = self.waiting.pop_front()
             if not self._can_admit(req):                  # 检查 running 上限/LoRA 等
-
+              
               break
             self.running.append(req)
             scheduled.append(req)
 
     return SchedulerOutput(scheduled)
+
 ```
 
 1. **在途请求优先于新请求**：先保证已经在跑的请求继续推进，剩余预算才用于接纳新请求。这避免了”新请求不断插队、老请求迟迟跑不完”的饥饿。
 2. **抢占发生在显存耗尽时**：当 `allocate_slots` 返回 `None`（申请不到 KV 块），调度器就挑一个”受害者”抢占，释放它的块后**重试分配**，直到成功或者**踢到当前请求自己**为止。FCFS 策略下踢掉 `running` 里的最后一个（最晚加入的），PRIORITY 策略下踢 `(priority, arrival_time)` 最大的那个，即优先级最低、同优先级里来得最晚的请求。
 
+
+
 被抢占的请求在 `_preempt_request()` 里经历一套清理：释放它的 KV 块和编码器缓存 → 状态置为 `PREEMPTED` → **`num_computed_tokens` 归零** → 重新塞回 `waiting` 队列的**队头**，等有资源了优先恢复。
 
-**关键点**：注意 `num_computed_tokens` 归零这一步——它意味着 V1 的抢占恢复策略是**重计算（Recompute）**：被抢占的请求下次调度时，从头把 Prompt 和已生成的 Token 重新 Prefill 一遍，而不是从 CPU 换回 KV（与第 3 节的两种恢复方式呼应）。官方调优文档说明 V1 默认用重计算而非换出，因为在 V1 架构下重计算开销更低；开着 Prefix Cache 时，被释放的满块若还没被淘汰，恢复时可以直接命中。
+**关键点**：注意 `num_computed_tokens` 归零这一步——它意味着 V1 的抢占恢复策略是**重计算（Recompute）**：被抢占的请求下次调度时，从头把 Prompt 和已生成的 Token 重新 Prefill 一遍，而不是从 CPU 换回 KV（这与 2.1 节讲的两种恢复方式呼应）。官方调优文档说明 V1 默认用重计算而非换出，因为在 V1 架构下重计算开销更低；开着 Prefix Cache 时，被释放的满块若还没被淘汰，恢复时可以直接命中。
 
-**提示**：读调度器源码时抓住这条主线——**`waiting`/`running` 两队列 + `token_budget` 预算 + `allocate_slots` 返回值驱动抢占**。前文的调度循环，落到代码就是这三者的相互作用。更深入的调度细节（Chunked Prefill 如何切分）见第 6 节；第 8 节会用 nano-vllm 的精简 Scheduler 再走一遍同样的流程。
+**提示**：读调度器源码时抓住这条主线——**`waiting`/`running` 两队列 + `token_budget` 预算 + `allocate_slots` 返回值驱动抢占**。第 4 节那个抽象的”调度循环”，落到代码就是这三者的相互作用。更深入的调度细节（Chunked Prefill 如何切分）见 2.4 节；第 3 章会用 nano-vllm 的精简 Scheduler 再走一遍同样的流程。
+
+
 
 Continuous Batching 虽好，但调度器面对的是一组相互冲突的目标，工程上要清楚这些权衡：
 
@@ -439,9 +460,9 @@ Continuous Batching 虽好，但调度器面对的是一组相互冲突的目标
 
 **注意**：Continuous Batching 让延迟指标变得**对负载敏感**。低负载时批次小、延迟低；高负载时批次变大、排队变长，P95/P99 尾延迟会明显上升。做容量规划时，一定要在**目标并发下**压测延迟，而不是看空载数据。
 
-### 两种调度器的直观对比
+# Mark
 
-**`running` 与 `waiting`**
+**sheduler的running，waiting**
 
 Waiting 是queue， running是list，然后waiting queue左老右新，append右边，peek左边，popleft 左边，preempt的req appendleft
 
@@ -449,19 +470,21 @@ running抢占pop尾部，加入也是append 尾部
 
 running 没有用链表来做到 O(1) 删除，因为调度时要按下标遍历，抢占时还要从尾部 pop。n 本来就很小，用 list 写起来简单，缓存局部性也好
 
+
+
 这里nano-vllm 和 vllm v1里
 
 prefill 影响首字延迟，decode 影响出字间隔。
 
-#### nano-vllm：一步处理一种阶段
+### nano-vllm：一步只能跑一种，
 
 每一步都要做选择：这一步给新请求做 prefill，还是给老请求做 decode？
 
-若始终优先 Decode，`running` 中有请求时新请求就难以进入，TTFT 可能很长，Batch 也会逐渐变小。
+如果选"先 decode"会怎样？ running 里只要还有序列，每一步都会是 decode，因为它们每步都有活干。新请求只能等 running 里所有序列都生成完才能进来，可能要等几百步。新请求的首字延迟非常长，而且 batch 越跑越小，GPU 越来越空闲。
 
-这个简化实现通常先处理新请求的 Prefill，再让它加入 `running` 一起 Decode；代价是已有请求的出字可能短暂停顿。这是该实现的调度取舍。
+所以只能"先 prefill"：有新请求就先把它 prefill 完，让它加入 running，之后大家一起 decode。代价是做 prefill 的那几步里，老请求停着不动，出字会卡一下。  
 
-#### vLLM V1：Prefill 与 Decode 可以混排
+### vLLM v1：一步能混着跑，所以两种都能做
 
 既然一步里两种都能放，问题就变成了：token 预算有限时，先满足谁？
 
@@ -471,7 +494,7 @@ decode 很便宜：每条序列只要 1 个 token。running 里有 50 条序列�
 
 结果是两边都照顾到了：老请求每步都前进，新请求也在同一步里开始 prefill。这里"先 decode"的意思不是让新请求等着，而是先扣掉decode的部分预算
 
-## 5. Prefix Cache 与 RadixAttention
+# day 5 Prefix Cache & RadixAttention
 
 前缀能复用的前提，是显存管理支持”多个请求指向同一份 KV”
 
@@ -483,9 +506,10 @@ decode 很便宜：每条序列只要 1 个 token。running 里有 50 条序列�
 
 **核心概念**：**Prefix Cache = 跨请求、跨时间地复用前缀 KV 块。** PagedAttention 的块共享是空间维度（并存请求共享），Prefix Cache 把它延伸到时间维度（先后请求复用）。
 
-### vLLM 的自动前缀缓存
+### vllm APC
 
 vLLM 的方案叫 **Automatic Prefix Caching（APC，自动前缀缓存）**。“Automatic”是它的一大亮点——**你不需要手动声明哪段是共享前缀，引擎自动检测并复用**。它靠的是对 KV 块做哈希。
+
 ```
 block_hash=Hash(parent_hash, block_tokens, extra)
 ```
@@ -503,9 +527,9 @@ vLLM 自 v0.11 起默认使用 `sha256` 作为哈希算法，也可通过 `--pre
 
 **关键点**：命中前缀缓存能**直接砍掉那部分 Prefill 的计算**，最直接的收益是**大幅降低 TTFT**（首 Token 更快出来），同时省下的算力还能服务更多请求。共享前缀越长、命中率越高，收益越大。
 
-#### V1 的低开销设计
+#### V1 的”零开销”设计
 
-vLLM V1 重写了前缀缓存管理：预建块元数据，并在块对象中嵌入双向链表指针，减少运行时分配和队列操作的开销。前缀缓存是否默认开启仍以具体版本和模型配置为准。
+早期版本（V0）里，前缀缓存因为命中率低时 CPU 记账开销不划算，默认是关闭的。vLLM **V1 引擎**对此做了重写：所有块在初始化时预分配成一个块池，用嵌入块内的双向链表指针做 O(1) 的移动与淘汰，把记账开销压到极低。官方设计文档称前缀缓存”几乎是免费的午餐”（almost a free lunch），V1 发布博客给出的数据是：即使命中率为 0%，吞吐下降也不到 1%。因此 **V1 中前缀缓存默认开启**。
 
 **为什么 V0 的 Prefix Caching 开销比较大**
 
@@ -547,7 +571,7 @@ class KVCacheBlock:
 
 这样每个 Block 对象本身就能成为链表节点，不需要再创建额外的包装节点。
 
-### 空闲块与淘汰
+### cache
 
 1. 最近最少使用的 Block 优先淘汰。
 2. 如果 Block 的最近使用时间相同（例如属于同一个 Request），则前缀更长的 Block 优先淘汰。
@@ -559,7 +583,7 @@ class KVCacheBlock:
 
 **提示**：这个”逆序入队”的小设计体现了一个朴素直觉——**越靠近序列开头的前缀，越通用、越值得留**；越靠后的前缀越个性化，留着也难命中。
 
-### SGLang 的 RadixAttention
+## SGLang  RadixAttention
 
 vLLM 的 Hash 方案高效，但它有个隐含限制：**匹配是”块对齐”且”线性前缀”的**——按块边界比对一条从头开始的前缀。而多轮对话、树状采样等场景里，请求的共享关系是**树状**的：一个共同前缀分叉出多个不同的后续。
 
@@ -571,7 +595,33 @@ SGLang 提出的 **RadixAttention** 用一棵 **Radix Tree（基数树/压缩前
 - 每个节点带一个**引用计数**，记录有几个运行中的请求正在用它；只有引用计数为 0 的节点才可淘汰。淘汰按 LRU 进行，并且**先淘汰叶子**，这样祖先节点上的公共前缀能留得更久。
 - 调度时优先处理与缓存共享前缀最长的请求（论文称为 cache-aware scheduling），在同样的缓存容量下提高命中率。
 
-Radix Tree 通过路径压缩表示公共前缀，并可对分叉进行显式管理。Cache-Aware Scheduling 则按前缀相似性安排请求：若 A、B 共享前缀而 C 不共享，A→B→C 可能比 A→C→B 更早复用 A 留下的 KV，降低缓存被中途淘汰的概率。这是调度策略的收益，不应全部归因于树结构。
+Radix Tree 的特点是路径压缩
+
+好处
+
+* 粒度更细
+
+* 显式树结构方便管理分叉和淘汰
+
+* Cache-Aware Scheduling
+
+  * SGLang 的 Cache-Aware Scheduling 正是考虑请求之间的前缀相似性，在适合的场景下把能够共享 KV 的请求安排得更接近。
+
+    这属于**调度优化，而不只是 Radix Tree 数据结构本身的优化**
+
+  * ACB，执行 C 可能把 A 中有价值的 `[System][Tool A]` 缓存淘汰掉，等 B 运行时，就可能需要重新 Prefill
+
+  * ABC，B 可以更早利用 A 已经计算过的前缀 KV，从而降低 Cache Thrashing
+
+  * 也就是说这里是scheduler单线程处理的，比如处理A 再C 再B，然后前缀匹配主要在cpu上完成，
+
+> **为什么一个可以并行化的 CPU 操作，推理框架却选择串行执行？**
+>
+> 核心原因有三个：
+>
+> 1. **单次 Prefix Matching 通常足够快**，并行带来的收益可能小于线程调度开销。
+> 2. **Radix Tree 不是纯只读数据结构**，匹配时可能修改树，导致并发控制复杂。
+> 3. **Scheduler 的关键目标是快速组织 GPU Batch**，而不只是最大化 CPU 核心利用率。
 
 不要把它们对立起来看。vLLM 的方案在绝大多数场景已经很够用，且随 V1 做到了近乎零开销；RadixAttention 是在**高度树状复用**的负载下（如复杂 Agent、大量并行采样）展现出额外优势。SGLang 论文在这类结构化 LLM 程序负载上报告了最高 6.4 倍的吞吐提升，这个数字来自 RadixAttention 与其他优化的组合。选型时看你的负载形态，而非简单认为”树一定比哈希好”。
 
@@ -580,26 +630,24 @@ Radix Tree 通过路径压缩表示公共前缀，并可对分叉进行显式管
 - **GPU**：存储实际的 KV Cache Tensor，并执行 Attention。
 - **CPU/GPU 之间**：通过 KV Index 将匹配到的前缀映射到对应的 KV 存储位置。
 
-### 回到 vLLM：缓存块如何复用
-
-`BlockPool` 初始化时会预建几套结构协同工作（呼应第 3 节）：
+`BlockPool` 初始化时会预建几套结构协同工作（呼应 2.1 节的源码走读）：
 
 | 结构                             | 作用                                                         |
 | :------------------------------- | :----------------------------------------------------------- |
 | Block Pool（块列表）             | 所有物理块的池子，进程启动时一次性预分配，避免运行时创建 Python 对象的开销 |
-| Free Block Queue（空闲双向链表） | 管理空闲块；持有节点引用时，支持 O(1) 从中间摘除。 |
+| Free Block Queue（空闲双向链表） | 管理空闲块，支持 O(1)*O*(1) 从中间摘除（前缀命中时”抢救”块） |
 | Cache（哈希 → 块 ID 映射）       | 前缀查表的核心：拿块哈希来查有没有可复用的物理块             |
 | Request（请求 → 块 ID 映射）     | 记录每个请求当前持有哪些块                                   |
 
 复用发生在调度器为新请求调用 `get_computed_blocks()` 时：把 Prompt 逐块哈希，去 Cache 表里查命中；命中的块被 `touch()`（引用计数 +1，并从空闲链表摘出以防被淘汰），随后 `allocate_slots()` 只为未命中的部分申请新块。
 
-在某些 V1 实现路径中，同哈希的满块可能短暂共存，随后在请求释放和缓存管理过程中被清理。读具体代码时，要区分请求的块表与全局哈希索引。
+**关键点**：V1 的块表是**只追加（append-only）**的——同哈希的重复满块可能短暂共存（因为块表不能改写），这些冗余”会在请求释放时被消除”。这是 V1 为了调度简洁性做的一个务实取舍，读源码时看到重复块不必惊讶。
 
 > **vLLM 的 Prefix Cache 只能复用当前 Request 已经确定的 Token 前缀，不能提前复用其他 Request 生成的未来 Token。**
 >
-> 即使两个请求后来生成了相同 Token，也不能简单把正在使用的物理块改指向另一块；块的哈希登记、复用和释放要遵守缓存管理器的生命周期规则。
+> 即使生成相同的后面token也不会替换，正常执行过程中不会因为发现重复就随意替换已有物理 Block ID，所以这里append-only设计会导致重复，然后这里hash_block会覆盖，也就是一个hash只对应一个block_id，然后req完了后会调用deallocate释放
 
-淘汰则是本节介绍的 LRU：需要腾地方时，从空闲链表**头部**弹出最久未用的块，把它的哈希从 Cache 表里删掉。而释放请求时块**逆序入队尾**，让哈希了最多 Token 的尾块（最难命中）优先被淘汰。
+淘汰则是第 4 节讲的 LRU：需要腾地方时，从空闲链表**头部**弹出最久未用的块，把它的哈希从 Cache 表里删掉。而释放请求时块**逆序入队尾**，让哈希了最多 Token 的尾块（最难命中）优先被淘汰。
 
 **前缀缓存收益大的场景**：
 
@@ -617,11 +665,11 @@ Radix Tree 通过路径压缩表示公共前缀，并可对分叉进行显式管
 
 **注意**：前缀缓存**不改变模型输出**（复用的是数学上完全等价的 KV），可以放心开启。但要留意多租户环境下的隔离——vLLM 提供 `cache_salt` 等机制，避免不同租户/权限的请求意外命中彼此的缓存造成信息泄露。
 
-## 6. Chunked Prefill 与 Token Budget
+# day 6 Chunked Prefill & Token Budget 
 
-Chunked Prefill 将长 Prompt 的 Prefill 分摊到多个调度步，使其可以与 Decode 混排，减少单步计算尖峰及 TPOT 抖动。
+**Chunked Prefill 用”把大块 Prefill 摊到多步”换来”Decode 的平稳”**，本质是把一次性的计算尖峰削平成多个可控的小峰，从而稳住 TPOT 尾延迟
 
-切块可能使该请求的 TTFT 增加，也可能因调度更灵活而减少排队；最终效果取决于负载和 Token Budget。
+切块会让这个长 Prompt 的 **TTFT 略微变大**（它要跨多步才 Prefill 完，首 Token 出得稍晚）。这是一个刻意的权衡——**牺牲少量单请求 TTFT，换取整批 Decode 的 TPOT 稳定**。在追求平稳出字体验的服务里，这笔交易通常很划算。
 
 Chunked Prefill 要落地，调度器需要一个统一的”度量衡”来决定每一步塞多少活。这个度量衡就是 **Token Budget（Token 预算）**。
 
@@ -630,14 +678,19 @@ Chunked Prefill 要落地，调度器需要一个统一的”度量衡”来决�
 - 一个做 Decode 的请求，这一步贡献 **1 个 Token**（生成下一个）。
 - 一个做 Prefill 的请求（或它的一个 Chunk），这一步贡献 **N 个 Token**（这一块的长度）。
 
-调度器给每一步设定 Token 预算上限（例如 2048 个 Token），通常先安排 `running` 中的请求，再将剩余预算分给新请求或 Prefill 的后续 Chunk。
-
+于是调度器给每一步设定一个总的 Token 预算上限（比如”这一步最多处理 2048 个 Token”），然后往里面装请求：先保证正在生成的 Decode 请求（每个占 1 个 Token 额度），剩下的预算再分给 Prefill 的 Chunk。预算用完，这一步就发车。
 $$
-\sum_{i \in \text{Decode}} 1 + \sum_{j \in \text{Prefill}} N_j \leq \text{Token Budget}
+[
+\underbrace{\sum{\text{Decode 请求}}1}_{\text{每个请求 1 Token}}
++
+\underbrace{\sum{\text{Prefill Chunk}}N_i}_{\text{每个 Chunk }N_i\text{ Tokens}}
+\leq
+\text{Token Budget}
+]
 $$
-Token Budget 统一约束本步的 Prefill 与 Decode 工作量。
+用 Token 预算这把统一的尺子，“Chunk 该切多大""一步能塞几个 Decode""长 Prefill 和 Decode 怎么共处一步”这些问题就都归结成了同一个装箱问题——**在预算内尽量把 GPU 装满，同时优先保证 Decode 不断流**。
 
-### V1 统一调度
+#### V1 统一调度
 
 ```python
 # V1 调度器每一步的决策，本质是这样一个映射
@@ -670,7 +723,7 @@ def schedule(self):
         num_tokens = min(need, token_budget)
         blocks = self.kv_cache_manager.allocate_slots(req, num_tokens)
         if blocks is None:
-            ...                                  # 显存不足：抢占并重试，细节见第 4 节
+            ...                                  # 显存不足：抢占并重试，细节见 2.2 节 6.2
             continue
         scheduled[req.id] = num_tokens          # {request_id: num_tokens}
         token_budget -= num_tokens
@@ -679,7 +732,7 @@ def schedule(self):
     # 源码里本步若发生过抢占，就跳过这一段，不接新请求
     while self.waiting and token_budget > 0 and self._can_admit():
         req = self.waiting.peek_front()
-        # 先查前缀缓存：命中的 token 不用再算（见第 5 节）
+        # 先查前缀缓存：命中的 token 不用再算（见 2.3 节）
         _, num_cached = self.kv_cache_manager.get_computed_blocks(req)
         need = req.num_tokens - num_cached
         num_tokens = min(need, token_budget)     # 长 prompt 首个 chunk 也在此截断
@@ -691,14 +744,15 @@ def schedule(self):
         token_budget -= num_tokens
 
     return SchedulerOutput(scheduled)
+
 ```
 
-例如：
+Eg：
 
 预算 2048：8 个 Decode 请求各取 1 个（蓝色）；running 里的长请求 R 还差 1440 个 Token 没 Prefill，一次拿完（黄色）；剩下的 600 分给 waiting 里 900 Token 的新请求 W1，它被截成首个 Chunk（绿色）；W2 没分到预算，留在队列里（灰色虚线）。
 
 1. **`min(need, token_budget)` 就是切块的本质**：一个 4000 Token 的 Prompt，若这一步只剩 512 预算，就只 Prefill 512，剩下 3488 留到后续步——它自动成了一个 Chunk，没有任何专门的”分块器”。
-2. **续块靠 `num_computed_tokens` 记账**：请求的”已计算到第几个 Token”被持久记录，下一步从断点继续，直到 `num_computed_tokens` 追上 `num_prompt_tokens`（Prefill 完成）后自然转入每步 +1 的 Decode。这体现了前文所说的统一调度视角。
+2. **续块靠 `num_computed_tokens` 记账**：请求的”已计算到第几个 Token”被持久记录，下一步从断点继续，直到 `num_computed_tokens` 追上 `num_prompt_tokens`（Prefill 完成）后自然转入每步 +1 的 Decode。这正是 2.2 节”不分 Prefill/Decode 阶段”在数据上的体现。
 
 **关键点**：理解 V1 调度的精髓就一句话——**`num_computed_tokens` 一路推向 `num_tokens_with_spec`，每步推进多少由 `min(剩余需求, 剩余预算)` 决定**。Chunked Prefill、Decode、投机解码验证，都只是这个式子在不同请求上取了不同的值。
 
@@ -717,7 +771,7 @@ V1 在条件允许时默认开启 Chunked Prefill，并且组批时优先安排 
 
 vLLM 官方调优文档给出了一个参考刻度：较小的值（如 2048）能得到更好的 ITL（Inter-Token Latency，相邻两个输出 Token 的间隔，与 TPOT 基本同义），因为拖慢 Decode 的 Prefill 更少；较大的值能缩短 TTFT，因为一步能 Prefill 更多 Token；追求吞吐时建议设到 8192 以上，小模型跑在大显存 GPU 上时尤其如此。
 
-**提示**：没有放之四海皆准的最优值。正确做法是**在你的目标负载（真实的 Prompt 长度分布、并发量）下压测**，观察 TTFT、TPOT P95/P99 和吞吐三条曲线，找到满足 SLO 的最大吞吐点。
+**提示**：没有放之四海皆准的最优值。正确做法是**在你的目标负载（真实的 Prompt 长度分布、并发量）下压测**，观察 TTFT、TPOT P95/P99 和吞吐三条曲线，找到满足 SLO 的最大吞吐点。具体调参会在第 3 章”vLLM 关键配置调优”里结合实例展开。
 
 **Chunked Prefill 收益明显的场景**：
 
@@ -734,9 +788,11 @@ vLLM 官方调优文档给出了一个参考刻度：较小的值（如 2048）�
 
 **注意**：Chunked Prefill 与 Prefix Cache 是天然搭档——前缀命中先砍掉一部分 Prefill 计算，剩下未命中的部分再切块掺入 Decode。二者叠加，长 Prompt 场景下的 TTFT 和 TPOT 能同时得到照顾。
 
-## 7. Attention 后端与图优化
+# Attention 后端与图优化
 
-Attention 后端决定注意力计算的实现；CUDA Graph 和 `torch.compile` 则用于减少前向执行中的 CPU 启动与小算子开销。
+FlashAttention/FlashInfer/FlashMLA/Triton
+
+图优化：用 CUDA Graph 和 torch.compile 消除 Decode 阶段的 CPU 启动开销
 
 **同样一批请求的一次前向计算，怎么让它跑得更快？**
 
@@ -749,32 +805,46 @@ GPU 自己不会主动干活，它每做一个操作（一次矩阵乘、一次 
 
 平时这点开销不算什么——因为 Prefill 一步要处理成千 Token，每个 GPU Kernel 一跑就是几百微秒甚至毫秒，CPU 那点启动开销被淹没了。但 **Decode 每步只处理 1 个（或很少几个）Token**，每个 Kernel 的实际计算可能就几微秒，结果**CPU 发射这个 Kernel 的时间比 GPU 执行它的时间还长**。于是 GPU 干几微秒就停下来，眼巴巴等 CPU 发下一条命令——算力再次闲置，只不过这次不是等数据，是**等指令**。
 
-Kernel 越短，CPU 发射开销在单步耗时中的占比越可能上升。
+Kernel越短空等占比越高
 
 Decode 阶段有两重”等待”——**等数据**（Memory Bound，靠 Batching/量化缓解）和**等指令**（CPU launch 开销，靠本节的图优化缓解）。小模型、小 Batch 时，后者尤其突出。这就是为什么图优化对 Decode 加速格外有效。
 
-| 后端 | 关注点 |
-| --- | --- |
-| FlashAttention | IO 感知的高性能注意力实现。 |
-| FlashInfer | 面向推理的注意力 Kernel 与 KV Cache 布局。 |
-| FlashMLA 等 | 适配 MLA 模型的专用实现。 |
-| Triton 实现 | 用 Triton 编写的特定注意力 Kernel。 |
+| 后端                     | 特点                                                         | 典型适用                                             |
+| :----------------------- | :----------------------------------------------------------- | :--------------------------------------------------- |
+| **FlashAttention**       | IO 感知的经典高性能实现，vLLM 按架构选用 FA2（Ampere）、FA3（Hopper）或 FA4（Blackwell） | Ampere、Hopper 上的默认后端                          |
+| **FlashInfer**           | 面向推理优化，KV Cache 处理灵活，支持多种数据类型            | Blackwell 上的默认后端；高吞吐服务、需要灵活 KV 布局 |
+| **FlashMLA** 等 MLA 后端 | 针对 MLA（Multi-head Latent Attention）优化                  | DeepSeek 等采用 MLA 结构的模型                       |
+| **Triton**               | 用 Triton 语言实现，可移植性好                               | 非 NVIDIA 硬件或需自定义时的兜底                     |
 
-后端由模型架构、GPU、数据类型、KV 布局和 vLLM 版本共同决定。通常先使用自动选择，再针对实际的 Prefill/Decode 比例做 Benchmark；不要只凭后端名称推断性能。
+**提示**：多数情况下不用手动指定，vLLM 会根据 GPU 架构、模型类型和数据精度**自动挑选**合适的后端。v0.32.0 在 Ampere 和 Hopper 上默认选 `FLASH_ATTN`，在 Blackwell 上默认选 `FLASHINFER`；MLA 模型会走专门的 MLA 后端。需要显式干预时，用 `--attention-backend` 指定后端，用 `--attention-config.flash_attn_version` 指定 FlashAttention 版本（2、3 或 4）。后端支持矩阵随版本演进较快，具体某张卡、某个模型用哪个后端，以你所用版本的官方文档为准。
 
-### 后端如何处理 Prefill/Decode 混合批次
+- **FlashAttention：通常是 Prefill-heavy 场景值得优先测试的选择。**
+- **FlashInfer：通常是 Decode-heavy、长 Context、高并发 Serving 场景值得优先测试的选择。**
+
+| Workload              | 优先测试       | 原因                                    |
+| --------------------- | -------------- | --------------------------------------- |
+| 长 Prompt、大 Prefill | FlashAttention | 大 Query Tile，Tensor Core 利用率高     |
+| 短 Prompt、长 Decode  | FlashInfer     | 专门优化 Paged KV 和 Decode             |
+| 高并发 Decode         | FlashInfer     | 可利用针对 Batch Decode 的专用 Kernel   |
+| 长 Context Decode     | FlashInfer     | Split-KV 等策略可能更有效               |
+| Prefill + Decode 混合 | 两者 Benchmark | 取决于具体 GPU 和 Batch 形状            |
+| Training / Backward   | FlashAttention | FlashAttention 提供成熟的前向、反向实现 |
+
+#### 后端如何处理 Prefill/Decode 混合批次
 
 这里有个上一节埋下的关键联系。vLLM V1 的统一调度器会把 **Prefill 的 Chunk 和 Decode 请求塞进同一步**——那么这一步的 Attention 该怎么算？毕竟 Prefill 部分要算”一整段新 Token 之间 + 对历史的注意力”，Decode 部分只算”1 个新 Token 对全部历史的注意力”，两者的计算形态不一样。
 
-执行层必须正确处理混合批次中的变长 Query 和 KV。具体后端可能使用变长接口、分段处理或不同 Kernel 路径，不能一概而论为「一次 Kernel 调用完成」。
+这就要求 Attention 后端**原生支持混合批次（mixed prefill/decode batch）**：在一次 Kernel 调用里，同时正确处理批中既有 Prefill 又有 Decode 的请求。FlashAttention 等现代后端提供的变长（varlen）接口正是为此设计的——它把批里所有请求的 Query 首尾拼成一个变长序列，配合每个请求的起止偏移，在一次 Kernel 调用里算完，不需要把 Prefill 和 Decode 拆成两次调用。
 
-### CUDA Graph
+**关键点**：**“统一调度器”（软件层抹平 Prefill/Decode）和”支持混合批次的 Attention 后端”（Kernel 层抹平 Prefill/Decode）是配套的。** 没有后者，V1 那套优雅的 Token 预算调度就落不了地。这也是为什么 V1 对 Attention 后端的能力有要求，早期不是所有后端都能支持。
+
+#### CUDA Graph
 
 但 CUDA Graph 有个硬性前提：**录制的操作序列和张量形状必须固定**。这对 Decode 是天作之合——每步都是”处理固定 Batch 个 Token”，形状稳定，可以针对不同的 Batch Size 分别录制好图，运行时按当前 Batch Size 选对应的图重放。
 
-vLLM 可为若干捕获尺寸预先录图，运行时将实际 Token 数补齐到合适的尺寸重放。是否能使用完整 CUDA Graph，还取决于 Attention 后端和图模式；较新的版本同时支持 full、piecewise 等模式，不能简单认为只有 Decode 才可能进入 CUDA Graph。具体捕获尺寸以所用版本配置为准。
+**注意**：正因为要求形状固定，vLLM 只为**一组预设的 Batch Size** 捕获 CUDA Graph。v0.32.0 的默认捕获尺寸是 `[1, 2, 4]`，加上 8 到 248 之间每隔 8 取一个，再加上 256 到 `max_cudagraph_capture_size` 之间每隔 16 取一个；`max_cudagraph_capture_size` 默认 512（数据中心级 Blackwell GPU 上为 1024），两者都可以通过 `compilation_config` 调整。运行时实际 Batch 会被**向上 Padding 到最近的已捕获尺寸**再重放，比如 13 个 Token 的批次按 16 的图跑，多出的 3 个位置是空算；只有超过最大捕获尺寸的批次才回退到逐 Kernel 启动。这也意味着 CUDA Graph 的收益主要体现在 Decode 这类小而规整的批次，大块的 Prefill 较难直接套用。
 
-### `torch.compile`
+#### torch.compile
 
 CUDA Graph 解决了”启动开销”
 
@@ -790,17 +860,20 @@ vLLM V1 的巧解是 **Piecewise CUDA Graph（分段 CUDA Graph）**：
 - **Attention 之外的部分**（LayerNorm、各种 GEMM、激活、残差……这些都是规整的 token-wise 操作）用 CUDA Graph 捕获、重放。
 - **Attention 本身保持 eager（即时）执行**，保留它处理变长 KV 的灵活性。
 
-**核心概念**：Piecewise CUDA Graph 在不适合整图捕获的算子处切分，分别捕获可重放的片段。完整图能否覆盖 Attention，由后端能力及图模式决定。
+**核心概念**：**Piecewise CUDA Graph = 对规整的部分用图优化榨干 CPU 开销，对灵活的 Attention 网开一面保留 eager。** 二者各取所长：CPU launch 开销大头（那成百上千个小算子）被 CUDA Graph 消灭，而 Attention 的灵活性（支持混合批次、变长 KV）不受损。这正是 V1 相比 V0 在 Decode 上提速的关键工程之一。
 
-纯 Decode 往往更容易重放完整图；Prefill 和混合批次是否可用，需要结合后端支持情况判断。
+这里decode由于形状固定，可以直接full cuda graph，prefill计算形状更动态
 
-### 为什么将 Attention 作为编译边界？
+batch向上padding到最近的捕获尺寸再重放，超过max_cudagraph_capture_size的批次不走 cuda graph
+
+#### 为什么要把 Attention 包装成黑盒？
 
 Attention 的麻烦在于：它需要处理不同长度的 Query、KV Cache、Attention Metadata 等动态信息。
 
 但 RMSNorm、MLP、Linear 等操作通常更规整，更适合 CUDA Graph。
 
 于是 vLLM 用自定义算子把 Attention 作为一个边界：
+
 ```
 torch.ops.vllm.unified_attention_with_output(...)
 ```
@@ -818,7 +891,8 @@ from vllm.config import CompilationConfig
 llm = LLM(
     model="meta-llama/Llama-3.1-8B-Instruct",
     compilation_config=CompilationConfig(
-        # 示例：为这些捕获尺寸录图；实际行为取决于图模式与后端。
+        # 只为这些 batch size 捕获 CUDA Graph；批次向上 Padding 到最近的尺寸重放，
+        # 超过最大值（这里是 32）的批次不走 CUDA Graph
         cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32],
         # 可选：为特定静态形状做 Inductor 自动调优（首次较慢，默认关闭）
         compile_sizes=[1, 2, 4, 8],
@@ -826,12 +900,14 @@ llm = LLM(
 )
 ```
 
-- `cudagraph_capture_sizes`：控制为哪些 Batch Size 捕获图。具体默认列表随版本变化；列表越长，覆盖越细、Padding 浪费越少，但捕获耗时和显存占用越多。
+- `cudagraph_capture_sizes`：控制为哪些 Batch Size 捕获图。不设时用第 4 节讲的默认列表；列表越长，覆盖越细、Padding 浪费越少，但捕获耗时和显存占用越多。
 - `compile_sizes`：让 Inductor 为指定静态形状做自动调优，找更快的 Triton 配置——收益是运行更快，代价是首次编译更慢，所以默认关闭。
 
 编译产物会写入**编译缓存**，默认位于 `~/.cache/vllm/torch_compile_cache`（缓存键包含所有相关配置与被追踪的源文件）。缓存目录可在部署间**直接拷贝**以省掉重复编译时间；调试时若想强制重编，可用 `VLLM_DISABLE_COMPILE_CACHE=1` 关闭缓存
 
 这里编译的是**Graph（计算图），但最终生成的是 Kernel（GPU 可执行代码）**
+
+
 
 - **收益**：Decode 阶段 CPU 开销大幅下降，小模型/小 Batch 下的吞吐和延迟明显改善；`torch.compile` 的算子融合进一步减少 Kernel 数量。
 - **代价**：
@@ -839,11 +915,12 @@ llm = LLM(
   - **显存占用**：捕获多个 Batch Size 的 CUDA Graph 需要额外显存。
   - **调试复杂度**：编译后的图不如 eager 模式好调试，排查数值问题时可能需要临时关掉。
 
-调试时可用 `--enforce-eager` 对比 eager 执行；它会跳过编译和 CUDA Graph 捕获。生产配置仍应以实测延迟、吞吐和启动成本为准。
+`--enforce-eager` 启动，它会同时关闭 `torch.compile` 和 CUDA Graph，用纯 eager 模式对比。定位完再去掉——生产环境务必保持开启，否则会白白损失 Decode 性能
 
-## 8. nano-vllm：简化实现
+# Nano-Vllm
 
-### 目录与模块分工
+## overview
+
 ```
 nanovllm/
 ├── __init__.py          # 对外导出 LLM, SamplingParams
@@ -885,7 +962,18 @@ flowchart LR
     B --> C
     C --> D
     D -. "KV Cache / logits" .-> B
+
+    style A fill:#f2f2f2,stroke:#222,stroke-width:2px,color:#222
+    style B fill:#ffead8,stroke:#222,stroke-width:2px,color:#222
+    style C fill:#dfe8fa,stroke:#222,stroke-width:2px,color:#222
+    style D fill:#def0eb,stroke:#222,stroke-width:2px,color:#222
+
+    linkStyle 0,1,2 stroke:#f58220,stroke-width:2px
+    linkStyle 3 stroke:#f58220,stroke-width:2px,stroke-dasharray:6 4
+
 ```
+
+
 
 **第一层：接口层（`llm.py` + `sampling_params.py` + `config.py`）**
 
@@ -899,11 +987,11 @@ flowchart LR
 
 这一层决定「这一步跑谁、它们的 KV 放哪儿」。`Scheduler` 决定本轮是 prefill 还是 decode、把哪些序列拼成一个 batch；`Sequence` 跟踪每条请求的 token、已缓存长度和状态；`BlockManager` 按 PagedAttention 的思路给 KV 分配物理块。这一层**只管资源分配与生命周期，不碰矩阵乘法**，所以 `BlockManager` 放在 `engine/` 而不是 `layers/`。
 
-**第四层：执行层（`model_runner.py` + `models/qwen3.py` + `layers/*`）**
+**第四层：执行层（`model_runner.py` + `models/qwen3.py` + `layers/\*`）**
 
 `ModelRunner` 把调度器选出的序列转成张量：构造 `input_ids`、`positions`、`slot_mapping`、`block_tables` 等，设置全局 `Context`，然后调用 `Qwen3` 前向。`layers/` 是算子级实现，其中 `attention.py` 有两项任务：把新的 K/V 写进 Cache，以及调用 FlashAttention 计算注意力。
 
-![nano-vllm 的推理调用流程](./vllm1.png)
+![](./vllm1.png)
 
 1. 用户调用 `llm.generate(prompts, sampling_params)`。prompt 可以是字符串，也可以是已经编码好的 token id 列表；字符串由 `add_request` 内部的 HuggingFace 分词器编码。
 2. `add_request` 为每条 prompt 创建一个 `Sequence`，放进 `Scheduler` 的 `waiting` 队列。
@@ -913,7 +1001,7 @@ flowchart LR
 6. `Scheduler.postprocess` 把新 token 写回对应 `Sequence`，判断是否命中 EOS 或达到 `max_tokens`。结束的序列释放 KV 块，未结束的留到下一轮 decode。
 7. 所有序列结束后，`generate` 按 `seq_id` 排序还原请求顺序，解码成字符串返回。
 
-### `generate` 调用流程
+## Generate
 
 对外 API 只有三样：`LLM`、`SamplingParams` 和 `generate`
 
@@ -942,11 +1030,12 @@ prompts = [
 # 4) 批量生成：每个元素是 {"text": ..., "token_ids": ...}
 outputs = llm.generate(prompts, sampling_params)
 print(outputs[0]["text"])
+
 ```
 
-### `Config` 与初始化
+### Config
 
-以下 `Config` 字段来自这份笔记所讨论的 nano-vllm 实现；上游版本更新后可能变化。
+`config.py` 里的 `Config` 是一个 `@dataclass(slots=True)`，把引擎运行需要的全局约束集中在一处。字段与默认值如下
 
 ```python
 @dataclass(slots=True)
@@ -962,6 +1051,7 @@ class Config:
     eos: int = -1                           # EOS token id（初始化后由 tokenizer 填入）
     kvcache_block_size: int = 256           # 每个 KV 块容纳的 token 数
     num_kvcache_blocks: int = -1            # KV 块总数（运行时按显存推算）
+
 ```
 
 构造后 `__post_init__` 做三条断言，加载 HF 配置，并把上下文长度截到模型支持的上限：
@@ -974,21 +1064,22 @@ def __post_init__(self):
     self.hf_config = AutoConfig.from_pretrained(self.model)
     self.max_model_len = min(self.max_model_len,
                              self.hf_config.max_position_embeddings)
+
 ```
 
-`@dataclass` 会生成 `__init__()`；`__post_init__()` 则在初始化后执行校验和派生字段的设置。
+PS: post init主要针对dataclass的，因为@dataclass后会自动生成`__init__()`
 
 **`kvcache_block_size = 256`**：每个 KV 块装多少个 token。块越大，块表（Block Table）越短、管理开销越小，但最后一块没填满造成的内部碎片也越大。`% 256 == 0` 这条断言来自底层算子的要求：flash-attn 的 `flash_attn_with_kvcache` 文档写明，传入 `block_table`（分页 KV）时 `page_block_size` 必须是 256 的倍数。nano-vllm 的 decode 路径和前缀命中的 prefill 路径都通过 `block_table` 读分页 KV，所以块大小只能取 256、512 这类值，256 是允许的最小值，不是在碎片和开销之间挑出来的折中。
 
-`256` 是这里讨论的 nano-vllm 版本的默认值；它与 vLLM 的块大小配置相互独立。
+`256` 是 nano-vllm 当前默认值。vLLM 使用自己的 PagedAttention 内核，常见默认 `block_size=16`，两者的默认值不要混为一谈。
 
-**`max_num_batched_tokens` 与 `max_num_seqs`**：前者是单步 Token Budget，后者是单步序列数上限。两者共同约束 Batch 大小。
+**`max_num_batched_tokens` 与 `max_num_seqs`**：前者限制一步最多算多少 token（主要约束 prefill），后者限制一步最多有多少条序列（主要约束 decode）。两者共同构成调度器的 **Token Budget**
 
-**`gpu_memory_utilization = 0.9`**：引擎加载权重并估计执行所需显存后，用剩余显存预算分配 KV 块。`num_kvcache_blocks` 因此初始为 `-1`，运行时再确定。
+**`gpu_memory_utilization = 0.9`**：引擎不按最大长度给每条请求预留 KV，而是先加载权重、用一次最大规模的 prefill 测出激活峰值，再把剩余配额全部切成 KV 块。`num_kvcache_blocks` 因此初始为 `-1`，运行时才算出来
 
-**`tensor_parallel_size ≤ 8`**：这是该实现配置中的断言；实际可用的 TP 度还受模型约束，Qwen3 实现要求注意力头数和 KV 头数都能被 TP 度整除。
+**`tensor_parallel_size ≤ 8`**：这是单机 8 卡的上限。实际可用的 TP 度还受模型约束，Qwen3 的实现要求注意力头数和 KV 头数都能被 TP 度整除
 
-### `SamplingParams`
+### SamplingParams
 
 nano-vllm 的 `SamplingParams` 只有三个字段：
 
@@ -1009,7 +1100,7 @@ class SamplingParams:
 
 **关键点**：`__post_init__` 断言温度必须大于 `1e-10`，也就是说 **nano-vllm 不支持贪心采样**（temperature=0）。它的 `Sampler` 只有一条随机采样路径：logits 除以温度后做 softmax，再用指数噪声取 argmax。温度为 0 时除法会出错，作者没有为这种情况单独写 argmax 分支，而是在入口处挡掉。想要接近确定性的输出，可以把温度设成一个很小的正数。
 
-### `LLM` 与 `LLMEngine`
+### llm & llmEngine
 
 `llm.py` 只有 5 行，`LLM` 直接继承 `LLMEngine`，类体是 `pass`，`generate` 等方法全部来自父类。所有初始化工作都在 `LLMEngine.__init__` 里，分四步：
 
@@ -1046,18 +1137,107 @@ class LLMEngine:
 这里有几处工程细节：
 
 - **为什么用 `spawn` 而不是 Linux 默认的 `fork`**：CUDA 运行时不支持在 `fork` 出的子进程里重新初始化。父进程一旦初始化过 CUDA，`fork` 出的子进程再用 GPU 就会报错。`spawn` 启动的是全新的解释器进程，每个 rank 各自初始化自己的 GPU。
-- **主从进程靠共享内存 + `Event` 通信**：`rank>0` 的 `ModelRunner` 在子进程的 `__init__` 末尾进入循环，等待任务。主进程把方法名和参数 pickle 后写进共享内存，再 `set` 每个 worker 的 `Event` 通知它读取。细节见 `ModelRunner` 的实现。
+- **主从进程靠共享内存 + `Event` 通信**：`rank>0` 的 `ModelRunner` 在子进程的 `__init__` 末尾进入循环，等待任务。主进程把方法名和参数 pickle 后写进共享内存，再 `set` 每个 worker 的 `Event` 通知它读取。细节见 3.6。
 - **分词器只在主进程**：编码和解码都是 CPU 任务，TP worker 只需要 token id，不需要各自加载一份分词器。
 - **`atexit` 清理**：退出时通过同一套 RPC 给子进程发 `"exit"`，再 `join` 回收，避免残留进程。
 
 **提示**：`Sequence.block_size = config.kvcache_block_size` 这一行容易被忽略。`Sequence` 用**类变量**记录块大小，所有序列共享同一个值，`num_blocks`、`last_block_num_tokens` 等属性都靠它计算。
 
-`fork` 复制父进程的状态，并通过写时复制共享尚未修改的内存页；`spawn` 启动新的 Python 解释器。若父进程已初始化 CUDA，再用 `fork` 创建需要使用 CUDA 的子进程，可能触发 PyTorch 的 *Poison Fork* 问题。nano-vllm 因此用 `spawn` 启动 TP worker。
-
-| 方式 | 进程状态 | CUDA 使用要点 |
-| --- | --- | --- |
-| `fork` | 继承父进程当时的状态，启动通常较快 | 避免在已初始化 CUDA 的父进程中 fork 出 CUDA worker。 |
-| `spawn` | 启动新解释器，重新导入模块 | worker 各自初始化 CUDA；入口通常需要 `if __name__ == "__main__":`。 |
+> `spawn` 和 `fork` 都是 Python 多进程（Multiprocessing）创建子进程的方式。
+>
+> **最核心的区别是：**
+>
+> - `fork`**：复制父进程当前的状态，创建子进程。**
+> - `spawn`**：启动一个全新的 Python 解释器，让子进程自己初始化。**
+>
+> 这就是为什么在 CUDA、PyTorch、vLLM 多 GPU 推理中，经常使用 `spawn`。
+>
+> `fork` 不是直接物理复制所有内存，而是使用 **Copy-on-Write（COW，写时复制）**
+>
+> 也就是说：
+>
+> - 刚 `fork` 时，父子进程的很多内存页可以共享。
+> - 其中一方修改某个内存页时，操作系统才会按需复制。
+> - 但父子进程拥有独立的虚拟地址空间，不是直接共享普通 Python 变量的修改。
+>
+> 假设父进程执行：
+>
+> ```python
+> import 
+> torchtorch.cuda.init()  # 初始化 CUDA Runtime
+> ```
+>
+> 此时父进程不仅有 Python 对象，还有 CUDA Runtime 管理的状态，包括 GPU Context、驱动资源、内存分配器相关状态等。
+>
+> ```python
+> import multiprocessing as mp
+> 
+> def worker():
+>     x = torch.randn(1024, device="cuda")
+> 
+> if __name__ == "__main__":
+>     torch.cuda.init()
+> 
+>     ctx = mp.get_context("fork")
+>     p = ctx.Process(target=worker)
+>     p.start()
+>     p.join()
+>     
+> """
+> RuntimeError: Cannot re-initialize CUDA in forked subprocess.
+> To use CUDA with multiprocessing,
+> you must use the 'spawn' start method
+> """
+> ```
+>
+> 因为 `fork()` 复制的主要是 **CPU 侧的进程状态**，并不能完整地复制和重建 CUDA Runtime 在 GPU 驱动及设备上的运行状态。
+>
+> 可以理解为：
+>
+> **CPU 内存状态被复制了，但 CUDA Runtime 所依赖的外部 GPU/驱动状态并没有被正确复制。**
+>
+> 于是子进程可能拿到不一致的状态。
+>
+> 这类问题通常称为 **Poison Fork**。
+>
+> `spawn` 不是从父进程当前状态继续执行，而是启动新的 Python 解释器
+>
+> ```python
+> import multiprocessing as mp
+> import torch
+> 
+> def worker(rank):
+>     torch.cuda.set_device(rank)
+> 
+>     x = torch.randn(1024, device=f"cuda:{rank}")
+> 
+>     print(f"Worker {rank}: {x.device}")
+> 
+> if __name__ == "__main__":
+>     ctx = mp.get_context("spawn")
+> 
+>     processes = []
+> 
+>     for rank in range(2):
+>         p = ctx.Process(target=worker, args=(rank,))
+>         p.start()
+>         processes.append(p)
+> 
+>     for p in processes:
+>         p.join()
+> ```
+>
+> 每个 Worker 都能够在自己的进程中初始化 CUDA Runtime，并选择对应的 GPU
+>
+> | 特性            | fork                         | spawn                      |
+> | --------------- | ---------------------------- | -------------------------- |
+> | 创建子进程      | 复制父进程状态               | 全新 Python 解释器         |
+> | 启动速度        | 通常较快                     | 通常较慢                   |
+> | 内存机制        | Copy-on-Write                | 独立初始化                 |
+> | Python 全局对象 | 继承父进程当时的状态         | 重新导入模块并重建必要状态 |
+> | CUDA            | 父进程已初始化 CUDA 后不安全 | 推荐使用                   |
+> | 传递参数        | 可继承部分进程状态           | 通常需要可 pickle 的对象   |
+> | 多线程安全性    | 多线程父进程 fork 有风险     | 通常更安全                 |
 
 ### add_request → step → postprocess
 
@@ -1106,42 +1286,45 @@ def step(self):
     outputs = [(seq.seq_id, seq.completion_token_ids)
                for seq in seqs if seq.is_finished]
     return outputs, num_tokens
+
 ```
 
 **关键点**：`num_tokens` 用**正负号**区分阶段。prefill 时返回正数，即这一步实际计算的 token 总量（开启 chunked prefill 后可能只是 prompt 的一部分）；decode 时返回负的 batch 大小 `-len(seqs)`。`generate` 根据符号分别计算 Prefill 和 Decode 吞吐（tok/s）显示在进度条上。这一行的位置不能挪到 `postprocess` 之后，否则 `num_scheduled_tokens` 已经被清零，prefill 吞吐会一直显示为 0。
 
-循环里的分工是：**`model_runner.call("run", ...)` 负责怎么算，`scheduler` 负责算谁、算完怎么办**。`call` 在 TP=1 时就是普通的方法调用，TP>1 时还会把同一个调用广播给其他 rank。下文继续展开模型执行层和关键算子。
+循环里的分工是：**`model_runner.call("run", ...)` 负责怎么算，`scheduler` 负责算谁、算完怎么办**。`call` 在 TP=1 时就是普通的方法调用，TP>1 时还会把同一个调用广播给其他 rank。后面三节分别展开执行层（3.3）、KV 管理（3.4）和调度层（3.5），3.6 再回到 `ModelRunner` 把它们串起来。
+
+- README 和 `example.py` 用到的对外 API 只有 `LLM`、`SamplingParams`、`generate`，返回含 `"text"` 和 `"token_ids"` 的 dict 列表；对话模板由调用方自己套。
+- `Config` 是 `@dataclass(slots=True)`，集中管理显存比例、Token Budget、TP 度、KV 块大小。`kvcache_block_size % 256 == 0` 来自 flash-attn 分页 KV 的要求。
+- `SamplingParams` 只有三个字段，且断言温度 > `1e-10`，不支持贪心采样。
+- `LLM` 是 `LLMEngine` 的空子类。`LLMEngine.__init__` 用 `spawn` 启动 TP worker、只在主进程持有分词器、注册 `atexit` 清理。
+- 主循环是 `generate → add_request → step → postprocess`。`step` 在 `postprocess` 之前统计 `num_tokens`，用正负号区分 prefill 和 decode；`generate` 最后按 `seq_id` 还原提交顺序。
 
 ### 模型骨架与核心算子
 
-#### Qwen3 Decoder Layer
+##### Qwen3
 
 执行层最终要跑的是 `models/qwen3.py` 里的 Transformer。先看一个 `Qwen3DecoderLayer` 的结构，它决定了各个算子的调用顺序。
 
-Qwen3 使用 Pre-Norm 和残差连接：归一化位于注意力与 MLP 子层之前。nano-vllm 的 `RMSNorm` 将部分残差相加与归一化合在一个调用中。
+Qwen3 用的是 **Pre-Norm + 残差**结构：归一化放在子层之前，残差直接跨过子层。nano-vllm 把残差相加放进了 norm 内部：
 
-#### Pre-Norm 与 Post-Norm
+##### Pre-Norm vs Post Norm
 
-Pre-Norm 将输入沿残差路径直接传给下一层，有利于深层网络的梯度传播；Post-Norm 在残差相加后归一化。下面的式子是单个子层的抽象形式。
+梯度传播更稳定、训练更容易收敛，因为pre norm 会保留x作为residence
 
 Pre-Norm
 
-$$
-x_{l+1}=x_l+F(\operatorname{Norm}(x_l))
-$$
+\[ x_{l+1}=x_l+F(\operatorname{Norm}(x_l)) \]
 
 Post-Norm
 
-$$
-x_{l+1}=\operatorname{Norm}(x_l+F(x_l))
-$$
+\[ x_{l+1}=\operatorname{Norm}(x_l+F(x_l)) \]
 
 ```python
 class Qwen3DecoderLayer(nn.Module):
-    def forward(self, positions, hidden_states, residual):
-        if residual is None:  # 第一层：残差从输入初始化
+  	def forward(self, position, hidden_states, residual):
+      	if residual is None:                       # 第一层：残差从输入初始化
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:  # 后续层：残差相加后归一化
+        else:                                       # 后续层：norm 同时吐出新残差
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -1151,20 +1334,23 @@ class Qwen3DecoderLayer(nn.Module):
 
 每一层做两件事：**先归一化 + 注意力，再归一化 + MLP**。残差 `residual` 从第一层一路传到最后一层。`RMSNorm` 可以接收上一层的残差，先把它加进来再归一化，同时返回相加后的新残差，所以 `DecoderLayer` 里不用反复写 `x = x + sublayer(norm(x))`。下面把这一层用到的算子逐个展开。
 
+Norm Attention Norm MLP
+
 #### RMSNorm
 
-RMSNorm 不做减均值操作，而是按均方根缩放。它比 LayerNorm 少一些计算，但两者并非在所有模型中都可直接互换。
+LLM 普遍用 RMSNorm 替代 LayerNorm。它去掉了减均值和偏置，只按均方根缩放，计算更少，效果相当
 
-nano-vllm 的 `RMSNorm` 有两个入口，均使用 `@torch.compile`。普通归一化的核心计算如下：
+nano-vllm 的 `RMSNorm` 有两个入口，都带 `@torch.compile`。普通归一化
 
 ```python
 @torch.compile
 def rms_forward(self, x):
     orig_dtype = x.dtype
-    x = x.float()                                  # 升到 fp32 计算均方
-    mean_square = x.pow(2).mean(dim=-1, keepdim=True)
-    x.mul_(torch.rsqrt(mean_square + self.eps))
+    x = x.float()                                  # 升到 fp32 求方差
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x.mul_(torch.rsqrt(var + self.eps))
     return x.to(orig_dtype).mul_(self.weight)      # 先转回原精度，再乘 γ
+
 ```
 
 带残差相加的版本，先在 fp32 里把残差加进来，相加结果转回原精度作为**新残差**，再对和做归一化：
@@ -1175,14 +1361,15 @@ def add_rms_forward(self, x, residual):
     orig_dtype = x.dtype
     x = x.float().add_(residual.float())           # 残差相加
     residual = x.to(orig_dtype)                    # 新残差 = 相加后的值
-    mean_square = x.pow(2).mean(dim=-1, keepdim=True)
-    x.mul_(torch.rsqrt(mean_square + self.eps))
+    var = x.pow(2).mean(dim=-1, keepdim=True)
+    x.mul_(torch.rsqrt(var + self.eps))
     return x.to(orig_dtype).mul_(self.weight), residual
+
 ```
 
-上面的 `input_layernorm(hidden_states, residual)` 调用使用带残差的版本。均方计算在 FP32 中完成，以减小低精度运算误差；编译器可能将相关操作融合。
+**提示**：上一节 `hidden_states, residual = self.input_layernorm(hidden_states, residual)` 调用的就是这个版本。残差相加和归一化写在同一个 `torch.compile` 函数里，编译器可以把它们融合成更少的 kernel。求方差在 fp32 里做，是为了避免 bf16 下平方求和损失精度。
 
-#### RoPE
+#### Rope
 
 RoPE（Rotary Position Embedding）不往输入里加位置向量，而是**按位置把 Q、K 的每一对维度旋转一个角度**，这样 Q 和 K 的点积只和两者的相对位置有关。频率表在初始化时预计算，cos 和 sin 拼成一个 buffer：
 
@@ -1220,20 +1407,31 @@ class SiluAndMul(nn.Module):
     def forward(self, x):
         gate, up = x.chunk(2, dim=-1)      # 前一半是 gate，后一半是 up
         return F.silu(gate) * up
+
 ```
 
 gate 和 up 合并成一个 Linear 再切，是因为一次大矩阵乘比两次小矩阵乘更能用满 GPU：输入 `x` 只读一次，kernel 启动次数也减半。QKV 合并成 `qkv_proj` 是同样的考虑。
 
 #### 并行 Linear 族与张量并行
 
-张量并行（Tensor Parallelism，TP）将矩阵乘分给多张卡。nano-vllm 的 `linear.py` 将不同切分方式封装为 Linear 子类；关键是区分输出维与输入维的切分。
+张量并行（Tensor Parallelism, TP）把一个大矩阵乘切到多张卡上并行算。nano-vllm 的 `linear.py` 把这套机制封装成一组 Linear 子类，模型代码选对类型就具备 TP 能力。关键是分清**沿哪个维度切**。下图以 TP=2 为例，蓝色和黄色分别是 rank0 和 rank1 负责的分片，红色是唯一需要通信的 all_reduce：
 
 - **`ColumnParallelLinear`（`tp_dim=0`）**：按**输出维**切分，每张卡算出一部分输出列。权重加载时用 `narrow` 沿 dim 0 取本 rank 的分片；前向是普通 `F.linear`，**不需要通信**。
 - **`RowParallelLinear`（`tp_dim=1`）**：按**输入维**切分，每张卡拿输入的一部分、算出部分和。所以 TP>1 时前向末尾要 `dist.all_reduce(y)` 把各卡结果加起来；偏置只在 rank 0 加，避免被累加 tp_size 次。
 - **`QKVParallelLinear`（ColumnParallel 的子类）**：把 Q、K、V 三个投影合并成一个大矩阵，输出维是 `(num_heads + 2 * num_kv_heads) * head_dim`。它的权重加载按**字符串** `shard_id`（`"q"`/`"k"`/`"v"`）定位各段的偏移。
 - **`MergedColumnParallelLinear`（ColumnParallel 的子类）**：把 gate、up 合并（上一节的 SwiGLU 用它），权重加载按**整数** `shard_id`（0=gate、1=up）索引 `output_sizes`。
 
-在这个 Qwen3 实现中，Column Parallel 让各卡用完整输入计算不同输出分片；Row Parallel 让各卡计算部分和，再用 `all_reduce` 合并。注意力的 `o_proj` 和 FFN 的 `down_proj` 各有一次这样的跨卡求和。
+把它们按 Transformer 的数据流排开，Column 和 Row 正好成对出现
+
+
+
+**Column Parallel** 都是用的完整的输入，但是计算不同输出，比如rank0用W0计算，rank1用W1计算，拆分的权重W
+
+**Row Parallel**按输入维度切分，切分输入 X = [X0 | X1], rank0有W0，rank1有W1，然后就可以Y0=X0W0，Y1=X1W1，最终Y=Y0+Y1
+
+
+
+**关键点**：**Column 切输出、Row 收输入**，一前一后配对，中间的激活在卡内保持切分状态、不必通信，只在每个子层的末尾做一次 all_reduce。所以每个 Transformer 层恰好有 **2 次 all_reduce**（Attention 的 `o_proj` 一次、FFN 的 `down_proj` 一次）。这是 Megatron-LM 提出的 TP 切分方式，nano-vllm 的 `linear.py` 用 156 行实现了它。
 
 **注意**：QKV 按头切分，所以 `Qwen3Attention` 断言注意力头数和 KV 头数都能被 tp_size 整除。Qwen3-0.6B 有 16 个 Q 头、8 个 KV 头，TP 度只能取 1、2、4、8。在 nano-vllm 里，KV 头数就是 GQA 模型 TP 度的上限（vLLM 会在 TP 度超过 KV 头数时复制 KV 头，nano-vllm 没有实现）
 
@@ -1272,14 +1470,17 @@ def forward(self, x):
         dist.gather(logits, all_logits, 0)
         logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
     return logits
+
 ```
 
 - **prefill 只取最后一个 token**：生成下一个 token 只需要序列最后一个位置的 logits。`cu_seqlens_q[1:] - 1` 定位每条序列在拼接张量里的末位，避免把整段 prompt 都投影到词表维度。一条 1000 token 的 prompt，LMHead 只需投影 1 行，而不是 1000 行。
-- **LMHead 用 `gather` 而非 `all_reduce`**：词表按**输出维**切（每卡算不同的 logits 列），要的是拼接而不是求和，所以用 `dist.gather` 收到 rank 0 再 `cat`，其他 rank 返回 `None`。Embedding 查表等价于 one-hot 向量乘权重矩阵，词表是这次乘法的输入维，所以用 `all_reduce`。**切输入维就 reduce，切输出维就 gather**，与前文 Column/Row 的切分规律一致。
+- **LMHead 用 `gather` 而非 `all_reduce`**：词表按**输出维**切（每卡算不同的 logits 列），要的是拼接而不是求和，所以用 `dist.gather` 收到 rank 0 再 `cat`，其他 rank 返回 `None`。Embedding 查表等价于 one-hot 向量乘权重矩阵，词表是这次乘法的输入维，所以用 `all_reduce`。**切输入维就 reduce，切输出维就 gather**，和第 5 节的 Column/Row 规律一致。
+
+这里gather相当于是拼接
 
 #### Attention
 
-每个 token 的 K/V 要存到 KV Cache 里对应的槽位（slot）。slot 编号由上层算好的 `slot_mapping` 给出，这里只按编号写入。nano-vllm 用一个很短的 Triton kernel 完成：
+每个 token 的 K/V 要存到 KV Cache 里对应的槽位（slot）。slot 编号由上层算好的 `slot_mapping` 给出（见 3.6），这里只按编号写入。nano-vllm 用一个很短的 Triton kernel 完成：
 
 ```python
 @triton.jit
@@ -1299,7 +1500,7 @@ def store_kvcache_kernel(key_ptr, key_stride, value_ptr, value_stride,
 
 包装函数 `store_kvcache` 从 `key.shape` 取出 `(N, num_heads, head_dim)`，令 `D = num_heads * head_dim`。传进来的 `key` 是 KV 头的张量，所以这里的 `num_heads` 实际是本 rank 的 KV 头数，`D` 就是一个 token 在一层里的 K（或 V）向量长度。`key_stride`/`value_stride` 由外层用 `key.stride(0)` 传入；包装函数还断言 `key.stride(-1) == 1`、`key.stride(1) == head_dim`、`k_cache.stride(1) == D`，确保每个 token 的 D 个元素在内存里连续，kernel 才能一次读写一整段。
 
-**提示**：用 PyTorch 写同样的逻辑，大致是 `k_cache.view(-1, D)[slot_mapping] = key.view(N, D)`。问题出在 `slot == -1` 的位置：CUDA Graph 回放时 decode batch 会补齐到固定大小，补出来的 token 的 slot 是 -1，这些位置不能写。PyTorch 里要先用掩码筛掉它们，筛选结果的长度随数据变化，不适合放进 CUDA Graph。Triton kernel 每个 program 处理一个 token，遇到 -1 直接返回，张量形状始终固定，可以被 Graph 捕获。
+**提示**：用 PyTorch 写同样的逻辑，大致是 `k_cache.view(-1, D)[slot_mapping] = key.view(N, D)`。问题出在 `slot == -1` 的位置：CUDA Graph 回放时 decode batch 会补齐到固定大小，补出来的 token 的 slot 是 -1（3.6 会讲），这些位置不能写。PyTorch 里要先用掩码筛掉它们，筛选结果的长度随数据变化，不适合放进 CUDA Graph。Triton kernel 每个 program 处理一个 token，遇到 -1 直接返回，张量形状始终固定，可以被 Graph 捕获。
 
 > **不是 PyTorch 不能使用 CUDA Graph，而是这种 PyTorch Boolean Mask 写法会产生动态长度的 Tensor，不适合直接进行 CUDA Graph Capture/Replay**
 
@@ -1326,13 +1527,14 @@ def forward(self, q, k, v):
             cache_seqlens=context.context_lens, block_table=context.block_tables,
             softmax_scale=self.scale, causal=True)
     return o
+
 ```
 
 - **prefill 用 `flash_attn_varlen_func`**：一次要算整段 prompt 的注意力，多条序列**变长**地拼在一起，靠 `cu_seqlens_q`/`cu_seqlens_k` 两组累积长度切分；`causal=True` 保证每个位置只看前文。如果本步的部分 K/V 已经在 Cache 里，`ModelRunner` 会传入 `block_tables`，这时 `k, v` 换成整块 `k_cache`/`v_cache`，kernel 按 `block_table` 去物理块里读完整的历史 K/V。有两种情况会触发：命中了前缀缓存，或者 chunked prefill 的后续块（前面的块上一步已经写进 Cache）。两种情况下 Q 都比 K 短，判断条件统一是 `cu_seqlens_k[-1] > cu_seqlens_q[-1]`。
 - **decode 用 `flash_attn_with_kvcache`**：每条序列只新增一个 token（`q.unsqueeze(1)` 补出长度维 1），K/V 全部来自 Cache，`cache_seqlens` 告诉 kernel 每条序列当前多长，`block_table` 告诉它去哪些物理块里读。
 - 缩放因子 `scale = head_dim ** -0.5`
 
-**关键点**：「Prefill 算力密集、Decode 访存密集」在代码里体现为两个阶段调用不同的 FlashAttention 接口。KV Cache 的物理块和 slot 由上层准备，这里只需记住 Attention 既负责写 Cache，也负责读 Cache。
+**关键点**：「Prefill 算力密集、Decode 访存密集」在代码里体现为两个阶段调用不同的 FlashAttention 接口。KV Cache 的物理块怎么分、slot 怎么算留到 3.4 和 3.6，这里只需记住 Attention 既负责写 Cache，也负责读 Cache。
 
 > 假设同一个 Prefill Batch：
 >
@@ -1351,6 +1553,8 @@ def forward(self, q, k, v):
 
 #### Qwen3 组装
 
+与llama不同
+
 **QKV 投影后对 Q、K 做 per-head RMSNorm**。Qwen3 在每个注意力头的 Q、K 上各加了一个 RMSNorm（即 QK-Norm），用来稳定训练
 
 ```python
@@ -1366,6 +1570,7 @@ def forward(self, positions, hidden_states):
     q, k = self.rotary_emb(positions, q, k)           # 再加旋转位置
     o = self.attn(q, k, v)
     return self.o_proj(o.flatten(1, -1))              # 把头维摊平后投影回 hidden
+
 ```
 
 `RMSNorm` 作用在最后一维 `head_dim` 上，所以把张量 reshape 成 `[token, 头, head_dim]` 后直接送进去，就是逐头归一化。QK-Norm 只在 `not self.qkv_bias` 时启用。`qkv_bias` 取自 HF 配置的 `attention_bias`（缺省按 `True` 处理），Qwen3 的配置里它是 `false`，所以走 QK-Norm 分支；带 QKV bias 的 Qwen2 式结构则不做 QK-Norm。
@@ -1380,6 +1585,7 @@ packed_modules_mapping = {
     "gate_proj": ("gate_up_proj", 0),    # 整数 shard_id
     "up_proj":   ("gate_up_proj", 1),
 }
+
 ```
 
 **HuggingFace 的 Qwen3 Checkpoint 把 Q/K/V、Gate/Up 分开存储，但 nano-vLLM 为了提高 GPU 计算效率，把它们合并成一个 Linear Layer。**
@@ -1390,7 +1596,7 @@ self.k_proj = nn.Linear(hidden_size, kv_size)
 self.v_proj = nn.Linear(hidden_size, kv_size)
 ```
 
-nano-vllm 中合并为：
+nanovllm
 
 ```python
 self.qkv_proj = QKVParallelLinear(...)
@@ -1411,6 +1617,7 @@ class Sampler(nn.Module):
         probs = torch.softmax(logits, dim=-1)
         noise = torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)  # E ~ Exp(1)
         return probs.div_(noise).argmax(dim=-1)                       # argmax(p / E)
+
 ```
 
 最后一行没有调用 `torch.multinomial`，而是给每个概率除以一个独立的指数分布随机数，再取最大值。这是 **Gumbel-max 技巧**的等价写法，结论是：
@@ -1433,9 +1640,11 @@ $$
 
 正好是按概率 $p$ 抽样。
 
-`torch.multinomial` 也能按概率采样；这里选用指数噪声形式，便于保持固定形状的张量计算。
+> torch.multinomial是随机采样
+>
+> 但是不用这个是因为 **Gumbel-max 这种写法更容易被编译器优化成固定形状的 GPU 计算。**
 
-指数噪声形式与按概率分布采样在数学上等价；具体 Kernel 数量和性能仍需以编译结果及实测为准。
+**效果和 `multinomial` 一样，但都是逐元素运算加一次 argmax**：除法、指数随机数、argmax 都能被 `torch.compile` 融合，不需要 `multinomial` 那样先做前缀和再二分查找。
 
 **温度只缩放 logits**：温度越高，softmax 越平，随机性越大。温度为 0 时第一行就会除以 0，这就是 `SamplingParams` 在入口处断言 `temperature > 1e-10` 的原因
 
@@ -1443,82 +1652,148 @@ $$
 
 nano-vllm 没有实现 top-k、top-p、重复惩罚等策略，`SamplingParams` 也只有三个字段
 
-### Scheduler：等待、运行与抢占
+### Scheduler
 
-nano-vllm 的 `Scheduler` 用两条队列管理请求：
+这个waiting和running，waiting是prefill没完成的，或者被preempt需要重新计算的，running是decode的
 
-| 队列 | 保存的请求 | 调度行为 |
-| --- | --- | --- |
-| `waiting` | 新请求、未完成 Prefill 的请求，以及被抢占后需重新计算的请求 | 优先安排 Prefill；未算完的请求留在队首，下一步继续。 |
-| `running` | Prefill 已完成、等待继续生成的请求 | 当本步没有可调度的 Prefill 时，才安排 Decode。 |
+### ModelRunner、CUDA Graph 与性能基准
 
-`schedule()` 返回 `(seqs, is_prefill)`，因此 nano-vllm **同一步只执行一种阶段**。Prefill 优先于 Decode；如果 Token Budget 不够，源码允许本批第一条请求分块 Prefill，后续请求等下一步。Decode 时若 KV 块不足，调度器会抢占请求、释放其块，并把它放回 `waiting` 队首。`postprocess()` 更新已缓存 Token 数、追加采样结果，并在 EOS 或长度上限时释放块。
+scheduler每次step调用一次ModelRunner.run
 
-### ModelRunner：从请求到 GPU 前向
 
-`LLMEngine.step()` 每轮调用一次 `ModelRunner.run(seqs, is_prefill)`。它把 `Sequence` 对象转成 GPU 张量，执行模型前向和采样；只有 rank 0 返回采样出的 Token ID。下列代码省略了类型标注：
 
 ```python
 def run(self, seqs, is_prefill):
-    if is_prefill:
-        input_ids, positions = self.prepare_prefill(seqs)
-    else:
-        input_ids, positions = self.prepare_decode(seqs)
+    input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
     temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-    logits = self.run_model(input_ids, positions, is_prefill)
+    logits = self.run_model(input_ids, positions, is_prefill)   # eager 或 CUDA Graph 回放
     token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
     reset_context()
     return token_ids
+
 ```
 
-初始化时，`ModelRunner` 依次建立 NCCL 进程组并绑定 GPU、加载模型权重、执行 warmup、分配 KV Cache；若未设置 `enforce_eager`，再捕获 Decode 的 CUDA Graph。TP 大于 1 时，rank 0 通过共享内存与 `Event` 通知其他 worker 执行相同操作。
+```mermaid
 
-#### Prefill 与 Decode 的张量准备
+flowchart LR
+    S["Scheduler<br/>选出 seqs + is_prefill"]
 
-Prefill 可把多条不同长度的请求拼接处理。`prepare_prefill()` 为本步待计算的 Token 生成 `input_ids`、`positions` 和 `slot_mapping`；用 `cu_seqlens_q` 标出本步 Query 的边界，用 `cu_seqlens_k` 标出包含历史前缀的 Key/Value 边界。若存在已缓存前缀，即总 K 长度大于总 Q 长度，还会准备 `block_tables`，让 Attention 从分页 KV Cache 读取历史部分。
+    subgraph RUN["ModelRunner.run — 一次 Step"]
+        direction LR
+        A["① 张量化 + set_context<br/>input_ids / positions<br/>slot_mapping"]
+        B["② run_model<br/>Eager / CUDA Graph"]
+        C["③ compute_logits"]
+        D["④ Sampler<br/>next token<br/>仅 rank 0"]
+        E["⑤ reset_context"]
 
-例如两条请求分别新增 2、3 个 Token，第一条已有 4 个历史 Token，第二条没有历史，则：
+        A --> B --> C --> D --> E
+    end
 
-```text
-cu_seqlens_q = [0, 2, 5]
-cu_seqlens_k = [0, 6, 9]
+    S --> A
+
+    style S fill:#f1f1f1,stroke:#555,color:#222
+    style A fill:#e4ecff,stroke:#555,color:#222
+    style B fill:#e0f2ed,stroke:#555,color:#222
+    style C fill:#e0f2ed,stroke:#555,color:#222
+    style D fill:#ffead9,stroke:#555,color:#222
+    style E fill:#f1f1f1,stroke:#555,color:#222
+    style RUN fill:#fafafa,stroke:#999,stroke-dasharray:5 5,color:#222
+
 ```
 
-`slot_mapping` 指定新 K/V 写入 KV Cache 的位置。对序列中的位置 `pos`，其物理槽位为：
+`ModelRunner.__init__` 在引擎启动时按固定顺序做完准备工作，后面几节逐个展开：
 
-```text
-block_index = pos // block_size
-slot = block_table[block_index] * block_size + pos % block_size
+1. 用 NCCL 初始化进程组，绑定本 rank 的 GPU，把默认 dtype 设成模型的 dtype（Qwen3-0.6B 是 bf16）。
+2. 构造 `Qwen3ForCausalLM` 并从 safetensors 加载权重。
+3. `warmup_model`：跑一次最大规模的 prefill，测出激活显存的峰值（第 4 节）。
+4. `allocate_kv_cache`：把剩余显存切成 KV 块（第 4 节）。
+5. `enforce_eager=False` 时 `capture_cudagraph`，预先捕获 decode 的 CUDA Graph（第 5 节）。
+6. TP>1 时建立共享内存，rank>0 进入 `loop` 等待指令（第 6 节）。
+
+模型 `forward` 吃的是张量，调度器给的是一批 `Sequence` 对象。`ModelRunner` 按阶段用两个准备函数做转换，两个阶段需要的张量形态不同。
+
+**Prefill：变长序列拼在一起**
+
+-  **`cu_seqlens`（cumulative sequence lengths）**：多条变长序列首尾相接后，用一串累积长度标出每条的边界，这是 `flash_attn_varlen_func` 要求的格式（见 3.3）。Q 侧只有本轮要算的 token，K 侧从序列开头算起。
+- **何时带 `block_tables`**：没有历史时，Q 和 K 一样长，kernel 直接用本轮新算出的 k/v。只要有一条序列的 K 比 Q 长，说明它的前半段 KV 已经在 Cache 里，这时才准备 `block_tables`，Attention 改从 Cache 读完整的 K/V（3.3 第 7.2 节）。
+- **`slot_mapping`**：每个 token 在 KV Cache 里的物理位置，等于 `物理块号 × block_size + 块内偏移`。3.3 的 Triton `store_kvcache` 按它把 K/V 写进 Cache。
+
+下图用 block_size = 4 演示一条命中 1 块前缀缓存的 10 token 序列（灰色是已在 Cache 里的 token，橙色是本轮要算的 token）：
+
+```python
+Engine 初始化（只执行一次）
+    │
+    ├── 加载模型权重
+    ├── 初始化 KV Cache
+    ├── 初始化 Scheduler
+    └── 准备 CUDA Graph
+    │
+    ▼
+Engine.generate()
+    │
+    ▼
+while not is_finished():     ← 外层 Loop
+    │
+    ▼
+Engine.step()
+    │
+    ├── Scheduler.schedule()
+    │       └── 选出 seqs, is_prefill
+    │
+    ├── ModelRunner.run(seqs, is_prefill)
+    │       │
+    │       ├── if is_prefill:
+    │       │       prepare_prefill(seqs)  ← 每个 Prefill Step 调用
+    │       │
+    │       ├── else:
+    │       │       prepare_decode(seqs)
+    │       │
+    │       └── model.forward(...)
+    │
+    └── Scheduler.postprocess()
+            ├── 更新 Token 进度
+            ├── Hash 完整 KV Blocks
+            └── 更新 Sequence 状态
+    │
+    └─────────────── 下一轮
 ```
 
-Decode 每条请求只处理一个新 Token。`prepare_decode()` 使用 `seq.last_token` 作为输入，并准备 `positions`、`context_lens`、`slot_mapping` 和 `block_tables`。`context_lens` 包含当前 Token：Attention 会先把它的 K/V 写入缓存，再读取该序列截至当前位置的 KV。TP worker 收到的 Decode 序列可以只有 `last_token`，不必传完整 Token 历史。
+- **读 `last_token` 而不是 `token_ids[-1]`**：TP>1 时 worker 收到的 decode 序列只有 `last_token`，没有 `token_ids`（3.4 第 3.1 节）。
+- **slot 的位置**：调度器在 `may_append` 里已经为跨块的 token 分好了新块，所以新 token 一定落在 `block_table[-1]` 里。
+- **`context_lens`**：告诉 `flash_attn_with_kvcache` 每条序列要读多少个历史 K/V。它把新 token 也算进去，因为 Attention 先执行 `store_kvcache` 把新 token 的 K/V 写进 Cache，再做注意力计算。
 
-`block_tables` 会用 `-1` 补齐为矩阵；这些是无效块占位。CUDA Graph 为补齐 Batch 而使用的 `slot_mapping = -1` 则表示对应的虚拟 Token 不应写入 KV Cache。两种 `-1` 的用途不同。
+**注意**：`block_tables` 右侧补的 -1 只用于对齐矩阵，kernel 只按 `context_lens` 读前面有效的块，不会访问补位。它和 `store_kvcache` 跳过的 `slot == -1` 不是一回事，后者来自 CUDA Graph 回放时补齐的 batch（第 5 节）。
 
-#### Context 与 KV Cache 分配
+#### 全局 Context：算子的”隐式参数”
 
-Attention、LMHead 等算子需要 `cu_seqlens`、`slot_mapping`、`block_tables` 和 `is_prefill` 等元数据。nano-vllm 用 `set_context()` 在前向前保存它们，算子通过 `get_context()` 读取，本步结束再调用 `reset_context()`。
+`cu_seqlens`、`slot_mapping`、`block_tables`、`is_prefill` 这些张量，Attention、LMHead 等算子都要用。如果当函数参数一层层传下去，`Qwen3ForCausalLM`、每个 `DecoderLayer`、每个 `Attention` 的 `forward` 都要多出七八个参数。nano-vllm 把它们放进一个**全局 Context**（`utils/context.py`），算子内部用 `get_context()` 现取
 
-KV Cache 在模型加载和 warmup 后分配。warmup 用假序列执行 Prefill，记录运行时的显存峰值；随后 `allocate_kv_cache()` 根据总显存、当前占用、峰值增量、`gpu_memory_utilization` 和单块字节数，计算可分配的 KV 块数量。单块字节数与层数、块大小、每卡 KV 头数、头维度及元素精度成正比。
+`slot_mapping` 指向的物理显存，是引擎启动时一次性分配好的。`ModelRunner` 不按最大长度给每条请求预留，而是**先加载权重、用 warmup 测出激活峰值，再把剩下的显存全切成 KV 块**。这就是 3.2 里 `num_kvcache_blocks` 初始为 `-1`、运行时才算出来的原因。
 
-#### nano-vllm 的 CUDA Graph 路径
+warmup 用一批假序列跑一次最大规模的 prefill：
 
-这个实现只对 Decode 捕获 CUDA Graph。`run_model()` 在 Prefill、`enforce_eager=True` 或 Batch 大于 512 时走 eager；否则选择一个不小于当前 Batch 的已捕获尺寸，填充输入缓冲区后重放图。图只覆盖模型前向得到 hidden states；`compute_logits()` 和采样仍在图外执行。
+```python
+def warmup_model(self):
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()              # 峰值统计从这里重新开始
+    seq_len = min(max_num_batched_tokens, max_model_len)
+    num_seqs = min(max_num_batched_tokens // seq_len, max_num_seqs)
+    seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]   # 没有 block_table 的假序列
+    for seq in seqs:
+        seq.num_scheduled_tokens = seq_len
+    self.run(seqs, True)
+    torch.cuda.empty_cache()
 
-捕获尺寸由代码构造为 `[1, 2, 4, 8]`，再加上不超过 `min(max_num_seqs, 512)` 的 16 的倍数。实际 Batch 例如为 13 时，可按 16 的图重放；填充位置的 `slot_mapping` 设为 `-1`，避免写入无效 KV。这里描述的是 nano-vllm 当前实现，不能直接套用到 vLLM 的图模式。
+```
 
-## 9. 投机解码：基本思路
+# Speculative Decoding
 
-投机解码由草稿模型等机制先提出若干候选 Token，再由目标模型并行计算这些位置的条件分布，按接受规则逐个验证。被接受的连续前缀可以减少目标模型逐 Token 前向的次数；若有拒绝，则按目标分布修正采样，以保持目标模型的输出分布。上面的 `slot_mapping` 计算属于 KV Cache 地址映射，并不是投机解码算法本身。此处仅记录概念，前文所述 nano-vllm `SamplingParams` 和调度器没有实现投机解码。
+先由别人提供几个**候选 Token**，Target 把它们当作已知输入，一次前向同时算出每个位置的条件分布，再逐个判断收不收
 
-## 参考资料
-
-- [vLLM Quickstart](https://docs.vllm.ai/en/stable/getting_started/quickstart/)：离线与在线调用。
-- [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/stable/design/prefix_caching/)：块哈希、共享和淘汰。
-- [vLLM Optimization and Tuning](https://docs.vllm.ai/en/stable/configuration/optimization/)：抢占、Chunked Prefill 与性能调参。
-- [vLLM CUDA Graphs](https://docs.vllm.ai/en/stable/design/cuda_graphs/)：完整图与分段图及后端兼容性。
-- [SGLang 论文](https://arxiv.org/abs/2312.07104)：RadixAttention 与 Cache-Aware Scheduling。
-- [nano-vllm 源码](https://github.com/GeeeekExplorer/nano-vllm)：第 8 节的简化实现。
-- [FlashAttention 分页 KV 接口](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_interface.py)：`page_block_size` 约束。
-- [PyTorch 多进程实践](https://docs.pytorch.org/docs/stable/notes/multiprocessing.html)：CUDA 与 Poison Fork。
-- [投机解码原论文](https://arxiv.org/abs/2211.17192)：草稿生成、目标模型验证与输出分布保持。
+```
+slot_mapping = []
+for pos in range(start, end):
+    idx = pos // block_size
+    slot_mapping.append(block_table[idx] * block_size + pos % block_size)
+return slot_mapping
+```
